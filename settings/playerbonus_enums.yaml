@@ -1,0 +1,118 @@
+# PlayerBonus domain enums. Mirrored from Java source. Edit here when the Java
+# enums change; the lookup_* lambdas read this file at import time.
+#
+# Each section: { id (int) -> human label }.
+# `default` is returned when the id isn't in the table; null = return None.
+
+bonus_type_name:
+  default: null
+  values:
+    0: RedeemEligble
+    1: FreeSpins
+    2: WheelSpin
+    3: JackpotWheel
+    4: FreeChips
+
+# BonusStatus (usermanagement/.../BonusStatus.java)
+bonus_status:
+  default: Canceled
+  values:
+    1: Active
+    2: Consumed
+    3: Pending
+    4: Canceled
+    5: Claimable
+    6: System Pending
+    7: Claimable Pending
+    8: Expired
+
+# BonusSpinsStatus (commoninfralib/.../BonusSpinsStatus.java:9-17)
+bonus_spins_status:
+  default: Unknown Status
+  values:
+    0: Pending
+    1: Initiate
+    2: Approved
+    3: Started
+    4: Declined
+    5: Finished
+    6: Closed
+    7: Canceled
+    8: Expired
+
+# BonusWheelSpinStatus (usermanagement/.../BonusWheelSpinStatus.java:10-15)
+bonus_wheel_status:
+  default: Closed
+  values:
+    1: Pending
+    2: Initiated
+    3: Started
+    4: Closed
+    5: Canceled
+    6: Expired
+
+# JackpotWheelStatusType — confirmed via live ES aggregation:
+# statusId=4 is "Closed" (capitalized, 1.08M docs); other ids are UPPERCASE.
+jackpot_wheel_status:
+  default: Closed
+  values:
+    1: PENDING
+    2: INITIATED
+    3: STARTED
+    4: Closed
+    5: CANCELED
+    6: EXPIRED
+
+# SkinGroup (gth-common-cache-model/.../SkinGroup.java:20-47); fallback "ANY" per :56-63
+skin_group:
+  default: ANY
+  values:
+    -1: ANY
+    1: SON Malta
+    2: Denmark Casinos
+    3: BG Skins
+    4: Benpark  Casinos
+    5: Europe Bet
+    6: UK Casinos
+    7: Test Casinos
+    8: Titanium Casinos
+    9: DE Casinos
+    10: PT Casinos
+    11: SE Casinos
+    12: Titanium casinos2
+    13: ES Casinos
+    14: DL Casinos
+    15: MX Casinos
+    16: SON Malta2
+    17: NL Casinos
+    18: ON Casinos
+    19: NJ Casinos
+    20: SPT Casinos
+    21: BA Casinos
+    22: MX2 Casinos
+    23: PE Casinos
+    24: Greece Casinos
+    25: BR Casinos
+
+# SkinOrigin (gth-common-cache-model/.../SkinOrigin.java:10-11)
+# Default null = unknown id returns None.
+skin_origin:
+  default: null
+  values:
+    -1: ANY
+    0: COM
+    1: DK
+    2: UK
+    3: DE
+    4: PT
+    5: SE
+    6: ES
+    7: DL
+    8: MX
+    9: NL
+    10: ON
+    11: NJ
+    12: BA
+    13: PE
+    14: GR
+    15: BR

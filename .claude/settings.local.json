@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__oracle-bi__execute_query",
+      "mcp__oracle-bi__filter_table_names"
+    ]
+  }
+}

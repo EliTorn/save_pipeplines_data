@@ -1,0 +1,16 @@
+field,type,format,full_path,is_array
+bin,text,,bin,false
+cardId,integer,,cardId,false
+companyName,keyword,,companyName,false
+creationDate,date,yyyy-MM-dd'T'HH:mm:ss.SSS,creationDate,false
+expiryDate,date,yyyy-MM-dd,expiryDate,false
+externalUserIds,keyword,,externalUserIds,true
+id,keyword,,id,false
+isBlacklisted,boolean,,isBlacklisted,false
+isVerified,boolean,,isVerified,false
+isWhitelisted,boolean,,isWhitelisted,false
+lastFourDigits,keyword,,lastFourDigits,false
+paymentMode,keyword,,paymentMode,false
+paymentSystem,keyword,,paymentSystem,false
+timeStamp,alias,,timeStamp,false
+userIds,keyword,,userIds,true
