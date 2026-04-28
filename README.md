@@ -106,7 +106,22 @@ apply_changes:
 
 ## How to run
 
-Install deps:
+Install deps. Two options:
+
+**Poetry (recommended):**
+
+```bash
+poetry install              # creates .venv and installs from pyproject.toml
+poetry run python main.py    # run inside the managed venv
+poetry shell                 # or drop into the venv shell
+```
+
+If you don't have `poetry.lock` yet, generate it once with `poetry lock`
+(needs the `poetry` CLI on `PATH`; `pipx install poetry` is the easiest
+install). The lockfile is what guarantees reproducible installs across
+machines — commit it after the first `poetry lock`.
+
+**pip:**
 
 ```bash
 pip install -r requirements.txt
@@ -116,12 +131,18 @@ Run the diff pipeline (every event with `IS_RUNNING: true`):
 
 ```bash
 python main.py
+# or
+poetry run python main.py
+# or
+poetry run pipeline                    # via [tool.poetry.scripts]
 ```
 
 Apply diffs back to ES for one event:
 
 ```bash
 python -m apply_changes.apply_changes --event PLAYERBONUS --env prod --mode both
+# or:  poetry run apply-changes --event PLAYERBONUS --env prod --mode both
+#
 # --mode  changes | missing | both
 # --env   stage | prod
 # --dry   print what would happen, no writes
@@ -133,6 +154,7 @@ Refresh ES schema CSVs (per index, from prod):
 ```bash
 python -m apply_changes.fetch_schemas             # all known indexes
 python -m apply_changes.fetch_schemas playerbonus  # one
+# or: poetry run fetch-schemas
 ```
 
 Streamlit settings editor / runner:

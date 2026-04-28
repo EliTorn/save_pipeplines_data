@@ -6,3 +6,4 @@ urllib3>=2.0
 streamlit>=1.30
 tqdm>=4.66
 oracledb>=2.0
+psycopg[binary]>=3.1

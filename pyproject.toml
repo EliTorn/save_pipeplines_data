@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "oracle-es-sync-pipeline"
+version = "0.1.0"
+description = "Oracle -> Elasticsearch comparison + apply pipeline (per-index adapter architecture)."
+authors = ["Eliyahu <eliyahu@gthsoftware.com>"]
+readme = "README.md"
+license = "Proprietary"
+packages = [
+    { include = "core" },
+    { include = "settings" },
+    { include = "apply_changes" },
+    { include = "connect_into_orcal" },
+    { include = "connect_into_es" },
+    { include = "connect_into_postgres" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pandas = ">=2.0"
+PyYAML = ">=6.0"
+python-dotenv = ">=1.0"
+requests = ">=2.31"
+urllib3 = ">=2.0"
+streamlit = ">=1.30"
+tqdm = ">=4.66"
+oracledb = ">=2.0"
+psycopg = {version = ">=3.1", extras = ["binary"]}
+
+[tool.poetry.group.dev.dependencies]
+# add lint/test tooling here as needed
+
+[tool.poetry.scripts]
+pipeline = "main:main"
+apply-changes = "apply_changes.apply_changes:main"
+fetch-schemas = "apply_changes.fetch_schemas:main"
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
