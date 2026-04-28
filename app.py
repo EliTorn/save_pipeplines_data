@@ -822,6 +822,119 @@ _PG_RENDERERS = {
 }
 
 
+def _index_to_event_map() -> dict[str, list[str]]:
+    """Resolve `{INDEX_NAME -> [event_name, ...]}` from events.yaml + per-index configs."""
+    from settings.loader import load_events
+    events = load_events()
+    out: dict[str, list[str]] = {}
+    for ev_name, entry in events.items():
+        idx = (entry.get("INDEX_NAME") or "").strip()
+        if idx:
+            out.setdefault(idx, []).append(ev_name)
+    return out
+
+
+def render_apply_page():
+    """Run apply_changes for one (index, env) selection. No hardcoded indexes —
+    dropdown comes from core.adapter_loader.known_indexes()."""
+    st.title("Apply diffs to Elasticsearch")
+    st.caption("Pushes pending diffs (Postgres `pipeline_changes` / `pipeline_missing`) "
+               "back into ES via `apply_changes`. Subprocess-isolated; safe to cancel by closing the tab.")
+
+    try:
+        from core.adapter_loader import get_adapter, known_indexes
+    except Exception as e:
+        st.error(f"failed to import adapter loader: {type(e).__name__}: {e}")
+        return
+
+    idx_to_events = _index_to_event_map()
+    indexes = [i for i in known_indexes() if i in idx_to_events]
+    orphan = [i for i in known_indexes() if i not in idx_to_events]
+
+    if not indexes:
+        st.warning("No indexes have an events.yaml entry. Add one before running apply.")
+        if orphan:
+            st.caption(f"Indexes with adapter but no event: {', '.join(orphan)}")
+        return
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        index = st.selectbox("Index", indexes, key="apply_index",
+                             help="Index to apply diffs for. List comes from settings/indexes/.")
+    with c2:
+        env_choice = st.radio("Environment", ["stage", "prod"], horizontal=True,
+                              index=0, key="apply_env_radio",
+                              help="prod requires ES_USER + ES_PASS + ES_URL_PRODE in .env.")
+
+    events_for_index = idx_to_events.get(index, [])
+    if len(events_for_index) > 1:
+        event = st.selectbox("Event", events_for_index, key="apply_event_pick",
+                             help=f"Multiple events map to index `{index}`. Pick one.")
+    else:
+        event = events_for_index[0]
+        st.caption(f"event = `{event}`")
+
+    try:
+        adapter = get_adapter(index)
+        st.caption(f"adapter = `{type(adapter).__module__}.{type(adapter).__name__}`")
+    except Exception as e:
+        st.error(f"failed to load adapter for {index!r}: {type(e).__name__}: {e}")
+        return
+
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        mode = st.radio("Mode", ["both", "changes", "missing"], horizontal=True,
+                        index=0, key="apply_mode_radio")
+    with mc2:
+        dry = st.checkbox("Dry run", value=True, key="apply_dry",
+                          help="Print what would happen, no writes.")
+    with mc3:
+        no_refresh = st.checkbox("Skip schema refresh", value=False, key="apply_no_refresh",
+                                 help="Skip pulling fresh ES mapping from prod before validation.")
+
+    if env_choice == "prod" and not dry:
+        st.warning("Real write to **prod**. Double-check the index, mode, and event before running.")
+
+    run_clicked = st.button(
+        f"Apply ({mode}) → {env_choice}",
+        type="primary",
+        use_container_width=True,
+        key="apply_run_btn",
+    )
+
+    log_box = st.empty()
+    last = st.session_state.get("apply_page_last")
+    if run_clicked:
+        log_box.code(f"starting apply_changes index={index} event={event} env={env_choice} "
+                     f"mode={mode} dry={dry} no_refresh={no_refresh}...", language="text")
+        cmd = [sys.executable, "-u", "-m", "apply_changes.apply_changes",
+               "--event", event, "--mode", mode, "--env", env_choice]
+        if dry:
+            cmd.append("--dry")
+        if no_refresh:
+            cmd.append("--no-refresh")
+        rc, full = _run_stream(cmd, log_box)
+        st.session_state["apply_page_last"] = {
+            "rc": rc, "out": full,
+            "index": index, "event": event, "env": env_choice,
+            "mode": mode, "dry": dry,
+        }
+        last = st.session_state["apply_page_last"]
+
+    if last:
+        tag = (f"index={last['index']} event={last['event']} env={last['env']} "
+               f"mode={last['mode']} dry={last['dry']}")
+        if last["rc"] == 0:
+            st.success(f"apply_changes exit=0 ({tag})")
+        else:
+            st.error(f"apply_changes exit={last['rc']} ({tag})")
+        if not run_clicked:
+            tail = "\n".join((last["out"] or "").splitlines()[-_LOG_TAIL:]) or "(empty)"
+            log_box.code(tail, language="text")
+        with st.expander("Full log"):
+            st.code(last["out"] or "(empty)", language="text")
+
+
 def render_postgres_page():
     """Postgres dashboards (read-only). 7 sub-pages selectable from sidebar."""
     st.title("Postgres viewer")
@@ -863,7 +976,10 @@ def render_postgres_page():
     _PG_RENDERERS[sub](pg_conn, conn)
 
 
-PAGE = st.sidebar.radio("Page", ["Pipeline", "Postgres"], index=0, key="page_selector")
+PAGE = st.sidebar.radio("Page", ["Pipeline", "Apply", "Postgres"], index=0, key="page_selector")
+if PAGE == "Apply":
+    render_apply_page()
+    st.stop()
 if PAGE == "Postgres":
     render_postgres_page()
     st.stop()
