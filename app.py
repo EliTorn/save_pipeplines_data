@@ -179,10 +179,23 @@ def list_events_with_changes() -> list[str]:
 
 
 def list_out_tree() -> list[Path]:
+    """All changes_/missing_in_es_ files anywhere under out/. Used by the
+    cross-event summary builder."""
     if not OUT_DIR.exists():
         return []
     return sorted(p for p in OUT_DIR.rglob("*")
                   if p.is_file() and "changes" in p.parts)
+
+
+def list_event_out_files(event: str, env: str) -> list[Path]:
+    """Files under out/<event>/<env>/changes/ only — what the per-event
+    page is allowed to surface."""
+    base = OUT_DIR / event / env / "changes"
+    if not base.exists():
+        return []
+    return sorted(p for p in base.iterdir()
+                  if p.is_file() and (p.name.startswith("changes_")
+                                      or p.name.startswith("missing_in_es_")))
 
 
 def clear_out_dir() -> tuple[int, int]:
@@ -1303,20 +1316,22 @@ else:
         apply_log.code(last_apply["out"] or "(empty)", language="text")
 
 st.markdown("---")
-st.markdown(f"**Files in `out/`** (`{OUT_DIR}`)")
-files = list_out_tree()
+_event_out_dir = OUT_DIR / sel / es_env / "changes"
+st.markdown(f"**Files for this event** (`out/{sel}/{es_env}/changes/`)")
+files = list_event_out_files(sel, es_env)
 if not files:
-    st.info("`out/` is empty or missing.")
+    st.info("No output file found for this run.")
+    st.stop()
 else:
     rows = []
     for f in files:
         rows.append({
-            "path": str(f.relative_to(OUT_DIR)).replace("\\", "/"),
+            "path": f.name,
             "size": f.stat().st_size,
             "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
-    st.caption(f"{len(files)} files")
+    st.caption(f"{len(files)} file(s) in {_event_out_dir}")
 
     show_files = st.checkbox("Show per-file contents (raw rows)", value=False,
                              help="Off = summary only. On = expand each changes_*.csv below.")
@@ -1326,7 +1341,7 @@ else:
     max_bytes = st.number_input("Max bytes per file", min_value=1024, max_value=5_000_000,
                                 value=200_000, step=10_000)
     for f in files:
-        rel = str(f.relative_to(OUT_DIR)).replace("\\", "/")
+        rel = f.name
         size = f.stat().st_size
         with st.expander(f"{rel}  —  {size} bytes", expanded=show_all):
             if size == 0:
