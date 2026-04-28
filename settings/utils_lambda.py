@@ -7,7 +7,7 @@ from typing import Any, Optional
 import yaml
 
 _SETTINGS_DIR = Path(__file__).resolve().parent
-_ENUMS_PATH = _SETTINGS_DIR / "playerbonus_enums.yaml"
+_ENUMS_PATH = _SETTINGS_DIR / "indexes" / "playerbonus" / "enums.yaml"
 
 
 def _is_nan_or_none(value: Any) -> bool:
@@ -329,14 +329,14 @@ def compose_expiration_from_days(row: dict) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# PlayerBonus enrichment — enum tables loaded from settings/playerbonus_enums.yaml
+# PlayerBonus enrichment — enum tables loaded from settings/indexes/playerbonus/enums.yaml
 # ---------------------------------------------------------------------------
 
 
 def _load_enums() -> dict[str, dict]:
     """Load `{name: {"values": {int: str}, "default": Any}}` once at import."""
     if not _ENUMS_PATH.is_file():
-        raise FileNotFoundError(f"playerbonus_enums.yaml not found at {_ENUMS_PATH}")
+        raise FileNotFoundError(f"enums.yaml not found at {_ENUMS_PATH}")
     raw = yaml.safe_load(_ENUMS_PATH.read_text(encoding="utf-8")) or {}
     out: dict[str, dict] = {}
     for name, spec in raw.items():
@@ -369,7 +369,7 @@ def _make_enum_lookup(enum_name: str, *, none_for_missing: bool = False):
     If `none_for_missing` and the input is None/NaN, return None instead of default."""
     spec = _ENUMS.get(enum_name)
     if spec is None:
-        raise KeyError(f"enum '{enum_name}' not in playerbonus_enums.yaml")
+        raise KeyError(f"enum '{enum_name}' not in indexes/playerbonus/enums.yaml")
     table = spec["values"]
     default = spec["default"]
 

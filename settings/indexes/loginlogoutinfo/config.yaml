@@ -1,0 +1,10 @@
+sql_file: sql/query.sql
+VALUE_COLM: mapping.csv
+MODE: time
+ES_ENV: stage
+PK: loginId
+TIME_DATE: LOGINDATE
+BANCH_VALUE: HOUR
+INDEX_NAME: loginlogoutinfo
+ORCAL_TYPE: timestape
+ES_TYPE: STRING

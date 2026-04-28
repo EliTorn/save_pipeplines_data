@@ -869,6 +869,43 @@ def dump_yaml(data: dict) -> None:
         yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
+def resolve_entry(entry: dict) -> dict:
+    """Read-only merge of indexes/<X>/config.yaml referenced by `index_config`.
+    Event-level keys override per-index defaults (parity with settings.loader)."""
+    ref = entry.get("index_config")
+    if not ref:
+        return dict(entry)
+    cfg_path = SETTINGS_DIR / ref
+    if not cfg_path.is_file():
+        return dict(entry)
+    base = cfg_path.parent
+    icfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    parts = icfg.pop("parts", None)
+    if parts:
+        rewritten = []
+        for p in parts:
+            p = dict(p)
+            for k in ("sql_file", "VALUE_COLM", "LOOKUP_SQL"):
+                rel = p.get(k)
+                if rel:
+                    try:
+                        p[k] = (base / rel).resolve().relative_to(SETTINGS_DIR.resolve()).as_posix()
+                    except ValueError:
+                        pass
+            rewritten.append(p)
+        icfg["parts"] = rewritten
+    else:
+        for k in ("sql_file", "VALUE_COLM", "LOOKUP_SQL"):
+            rel = icfg.get(k)
+            if rel:
+                try:
+                    icfg[k] = (base / rel).resolve().relative_to(SETTINGS_DIR.resolve()).as_posix()
+                except ValueError:
+                    pass
+    out = {**icfg, **{k: v for k, v in entry.items() if k != "index_config"}}
+    return out
+
+
 def load_csv_fields(rel: str) -> list[str]:
     path = SETTINGS_DIR / rel
     if not path.is_file():
@@ -930,7 +967,7 @@ sel = st.sidebar.radio("Event", events, index=0)
 if st.sidebar.button("Reload from disk"):
     st.rerun()
 
-entry = cfg[sel]
+entry = resolve_entry(cfg[sel])
 st.subheader(sel)
 
 is_running = st.toggle("IS_RUNNING", value=bool(entry.get("IS_RUNNING", False)),

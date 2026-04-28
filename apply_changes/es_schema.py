@@ -1,7 +1,7 @@
 """ES schema i/o + pre-write type validation for apply_changes.
 
 Pulls the live mapping from ES prod for each index we update, flattens it to a CSV
-(`field,type,format,full_path,is_array`) under `settings/es_schema/<index>.csv`, and
+(`field,type,format,full_path,is_array`) under `settings/indexes/<index>/schema.csv`, and
 provides `validate_doc()` so apply_changes can refuse to write a doc whose values
 don't match the ES schema.
 

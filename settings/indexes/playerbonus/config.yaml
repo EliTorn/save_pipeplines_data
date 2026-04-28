@@ -1,0 +1,34 @@
+parts:
+  - sql_file: parts/redeem/sql.sql
+    VALUE_COLM: parts/redeem/mapping.csv
+    TIME_DATE: ISU.CREATEDDATE
+  - sql_file: parts/freespins/sql.sql
+    VALUE_COLM: parts/freespins/mapping.csv
+    TIME_DATE: FS.CREATEDATE
+    LOOKUP_SQL: lookup/menu_items.sql
+    LOOKUP_KEY_COL: MENUITEMIDS
+    LOOKUP_OUTPUT_COL: menuItems
+    LOOKUP_KEY_TYPE: csv
+  - sql_file: parts/wheelspin/sql.sql
+    VALUE_COLM: parts/wheelspin/mapping.csv
+    TIME_DATE: WS.CREATEDDATE
+    LOOKUP_SQL: lookup/menu_items.sql
+    LOOKUP_KEY_COL: MENUITEMSIDS
+    LOOKUP_OUTPUT_COL: menuItems
+    LOOKUP_KEY_TYPE: csv
+  - sql_file: parts/jackpot/sql.sql
+    VALUE_COLM: parts/jackpot/mapping.csv
+    TIME_DATE: JWB.CREATEDDATE
+    LOOKUP_SQL: lookup/menu_items.sql
+    LOOKUP_KEY_COL: MENU_ITEM_ID
+    LOOKUP_OUTPUT_COL: menuItems
+    LOOKUP_KEY_TYPE: single
+MODE: time_union
+ES_ENV: prod
+PK: id
+BANCH_VALUE: 30 MINUTES
+INDEX_NAME: playerbonus
+STAMP_UPDATE_DATE: true
+ES_TIME: createdDate
+ORCAL_TYPE: date
+ES_TYPE: DATE

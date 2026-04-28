@@ -1,0 +1,9 @@
+sql_file: sql/query.sql
+VALUE_COLM: mapping.csv
+MODE: id_range
+ES_ENV: stage
+PK: userId
+ID_COLUMN: U.USERID
+BANCH_VALUE: 5000
+INDEX_NAME: playerinfoidx
+LIMIT_BATCHES: 100

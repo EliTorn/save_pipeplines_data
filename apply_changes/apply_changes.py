@@ -41,7 +41,12 @@ if str(_ROOT) not in _sys.path:
 YAML_PATH = _ROOT / "settings" / "events.yaml"
 SETTINGS_DIR = _ROOT / "settings"
 OUT_DIR = _ROOT / "out"
-SCHEMA_DIR = SETTINGS_DIR / "es_schema"
+INDEXES_DIR = SETTINGS_DIR / "indexes"
+
+
+def schema_csv_path(index: str) -> Path:
+    """settings/indexes/<index>/schema.csv (per-index layout)."""
+    return INDEXES_DIR / index / "schema.csv"
 
 from _pipeline_env import env_truthy, normalize_es_env  # noqa: E402
 
@@ -133,7 +138,8 @@ def _now_es_iso() -> str:
 # ---------------------------------------------------------------------------
 
 def load_event(event: str) -> dict:
-    cfg = yaml.safe_load(YAML_PATH.read_text(encoding="utf-8"))
+    from settings.loader import load_events
+    cfg = load_events()
     if event not in cfg:
         sys.exit(f"event '{event}' not in events.yaml; available: {list(cfg)}")
     return cfg[event]
@@ -675,7 +681,8 @@ def main():
         print(f"STAMP_UPDATE_DATE=on → every doc op will set updateDate=now()")
 
     # Auto-refresh ES schema CSV from prod (always prod regardless of --env).
-    schema_csv = SCHEMA_DIR / f"{index}.csv"
+    schema_csv = schema_csv_path(index)
+    schema_csv.parent.mkdir(parents=True, exist_ok=True)
     if not args.no_refresh:
         try:
             print(f"refreshing ES schema for '{index}' from prod...")

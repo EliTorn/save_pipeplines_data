@@ -1,87 +1,23 @@
 PIPELINE_DIFF_MODE: changes
 LOGING_LOGOUT:
-  sql_file: sql/LOGING_LOGOUT.sql
-  VALUE_COLM: mappings/LOGING_LOGOUT.csv
-  MODE: time
-  ES_ENV: stage
-  PK: loginId
-  TIME_DATE: LOGINDATE
-  BANCH_VALUE: HOUR
-  INDEX_NAME: loginlogoutinfo
+  IS_RUNNING: false
+  index_config: indexes/loginlogoutinfo/config.yaml
   START_TIME: '2026-04-20 07:00:00'
   END_TIME: '2026-04-20 09:00:00'
-  ORCAL_TYPE: timestape
-  ES_TYPE: STRING
-  IS_RUNNING: false
   FILED_THAT_RUN: userId,externalUserId,loginId,parentId,externalParentId,skinId,skin,skinGroupId,skinOriginId,loginDate,logoutDate,ip,logoutCode,countryId,realBalance,bonusBalance,loginTypeId,channelId,internalAccount,isWeb,nativeApp,os,browserName,appBuildNumber,ipCity,skinGroup,skinOrigin
 CARDUSERS:
-  parts:
-    - sql_file: sql/CARDUSERS_APPLE_PAY.sql
-      VALUE_COLM: mappings/CARDUSERS_APPLE_PAY.csv
-      TIME_DATE: ADU.CREATE_DATE
-    - sql_file: sql/CARDUSERS_REGULAR.sql
-      VALUE_COLM: mappings/CARDUSERS_REGULAR.csv
-      TIME_DATE: CCU.CREATIONDATE
-  MODE: time_union
-  ES_ENV: prod
-  PK: id
-  BANCH_VALUE: DAY
-  INDEX_NAME: cardusers
-  ES_TIME: creationDate
+  IS_RUNNING: false
+  index_config: indexes/cardusers/config.yaml
   START_TIME: '2026-04-01 00:00:00'
   END_TIME: '2026-04-02 00:00:00'
-  ORCAL_TYPE: date
-  ES_TYPE: DATE
-  IS_RUNNING: false
   FILED_THAT_RUN: id,cardId,creationDate,lastFourDigits,expiryDate,isWhitelisted,isBlacklisted,isVerified,companyName,paymentMode,bin,externalUserIds,userIds,paymentSystem
 PLAYERBONUS:
-  parts:
-    - sql_file: sql/playerbonus/template_a_redeem_eligible.sql
-      VALUE_COLM: mappings/playerbonus/template_a_redeem_eligible.csv
-      TIME_DATE: ISU.CREATEDDATE
-    - sql_file: sql/playerbonus/template_b_freespins_freechips.sql
-      VALUE_COLM: mappings/playerbonus/template_b_freespins_freechips.csv
-      TIME_DATE: FS.CREATEDATE
-      LOOKUP_SQL: sql/playerbonus/menu_items_lookup.sql
-      LOOKUP_KEY_COL: MENUITEMIDS
-      LOOKUP_OUTPUT_COL: menuItems
-      LOOKUP_KEY_TYPE: csv
-    - sql_file: sql/playerbonus/template_c_wheelspin.sql
-      VALUE_COLM: mappings/playerbonus/template_c_wheelspin.csv
-      TIME_DATE: WS.CREATEDDATE
-      LOOKUP_SQL: sql/playerbonus/menu_items_lookup.sql
-      LOOKUP_KEY_COL: MENUITEMSIDS
-      LOOKUP_OUTPUT_COL: menuItems
-      LOOKUP_KEY_TYPE: csv
-    - sql_file: sql/playerbonus/template_d_jackpot_wheel.sql
-      VALUE_COLM: mappings/playerbonus/template_d_jackpot_wheel.csv
-      TIME_DATE: JWB.CREATEDDATE
-      LOOKUP_SQL: sql/playerbonus/menu_items_lookup.sql
-      LOOKUP_KEY_COL: MENU_ITEM_ID
-      LOOKUP_OUTPUT_COL: menuItems
-      LOOKUP_KEY_TYPE: single
-  MODE: time_union
-  ES_ENV: prod
-  PK: id
-  BANCH_VALUE: 30 MINUTES
-  INDEX_NAME: playerbonus
-  STAMP_UPDATE_DATE: true
-  ES_TIME: createdDate
+  IS_RUNNING: true
+  index_config: indexes/playerbonus/config.yaml
   START_TIME: '2026-04-01 00:00:00'
   END_TIME: '2026-04-02 00:00:00'
-  ORCAL_TYPE: date
-  ES_TYPE: DATE
-  IS_RUNNING: true
   FILED_THAT_RUN: id,userBonusId,userId,externalUserId,skinId,skin,skinGroup,skinOrigin,parentId,externalParentId,skinOriginId,skinGroupId,currency,internalAccount,statusId,status,bonusType,createdDate,expirationDate,expirationDays,bonusName,activeDays,amount,amountLeft,points,promoCode,description,freeSpinAmount,freeSpinsLeft,chipCountLeft,amountWon,sessionId,maxWin,prizeWon,worth,menuItemsIds,menuItems,twisterPrizeWon,triggeringTransactionId,triggeringCause
 dle:
-  sql_file: sql/UPDATE_SALARY.sql
-  VALUE_COLM: mappings/UPDATE_SALARY.csv
-  MODE: id_range
-  ES_ENV: stage
-  PK: userId
-  ID_COLUMN: U.USERID
-  BANCH_VALUE: 5000
-  INDEX_NAME: playerinfoidx
   IS_RUNNING: false
-  LIMIT_BATCHES: 100
+  index_config: indexes/playerinfoidx/config.yaml
   FILED_THAT_RUN: userId,salary
