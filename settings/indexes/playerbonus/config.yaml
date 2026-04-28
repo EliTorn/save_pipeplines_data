@@ -28,7 +28,6 @@ ES_ENV: prod
 PK: id
 BANCH_VALUE: 30 MINUTES
 INDEX_NAME: playerbonus
-STAMP_UPDATE_DATE: true
 ES_TIME: createdDate
 ORCAL_TYPE: date
 ES_TYPE: DATE

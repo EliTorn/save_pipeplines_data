@@ -274,8 +274,27 @@ _PLAYERBONUS_LAMBDAS = {
 }
 
 
+_FIELD_KIND_OVERRIDES = {
+    "parentId":                 "int_str",  # ES=keyword, lambdas emit int
+    "maxWin":                   "int_str",  # ES=keyword, lambdas emit int
+    "triggeringTransactionId":  "int",      # ES=integer, mapping lambda empty -> str fallback
+}
+
+
 class Adapter(IndexAdapter):
     INDEX_NAME = "playerbonus"
 
     def lambdas(self):
         return dict(_PLAYERBONUS_LAMBDAS)
+
+    def field_kind_overrides(self):
+        return dict(_FIELD_KIND_OVERRIDES)
+
+    def before_apply(self, doc: dict) -> dict:
+        """Stamp updateDate=now() on every PLAYERBONUS doc before sending to ES.
+
+        Mirrors Java `playerBonusVO.setUpdateDate(Timestamp.valueOf(DBManager.nowLocalDateTime()))`."""
+        from core.coerce import now_es_iso
+        out = dict(doc)
+        out["updateDate"] = now_es_iso()
+        return out

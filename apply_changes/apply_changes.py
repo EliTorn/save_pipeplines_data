@@ -14,11 +14,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -27,7 +25,6 @@ from pathlib import Path
 import pandas as pd
 import requests
 import urllib3
-import yaml
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
@@ -53,6 +50,8 @@ from _pipeline_env import env_truthy, normalize_es_env  # noqa: E402
 from apply_changes import es_schema as es_schema_io
 from apply_changes import pg_tracking
 from apply_changes import pg_source
+from core.adapter_loader import get_adapter
+from core.coerce import field_types, now_es_iso
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 BATCH_SIZE = int(os.getenv("APPLY_BATCH_SIZE", "1000"))
 POLL_INTERVAL = float(os.getenv("APPLY_POLL_INTERVAL_SEC", "2.0"))
@@ -126,13 +125,6 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _now_es_iso() -> str:
-    """ES `updateDate` format: yyyy-MM-dd'T'HH:mm:ss.SSS (matches PlayerBonusVO @Field DateFormat).
-    Mirrors Java `playerBonusVO.setUpdateDate(Timestamp.valueOf(DBManager.nowLocalDateTime()))`."""
-    n = datetime.now()
-    return n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{n.microsecond // 1000:03d}"
-
-
 # ---------------------------------------------------------------------------
 # YAML / mapping introspection
 # ---------------------------------------------------------------------------
@@ -159,115 +151,6 @@ def collect_mapping_rows(entry: dict) -> list[dict]:
         with open(path, encoding="utf-8", newline="") as f:
             rows.extend(csv.DictReader(f))
     return rows
-
-
-# ---------------------------------------------------------------------------
-# Type-coercion table from mapping lambdas
-# ---------------------------------------------------------------------------
-
-_LAMBDA_TYPE = {
-    "convert_int_to_string": "str_int",
-    "convert_to_int_strict":  "int",
-    "convert_int_or_zero":    "int",
-    "convert_int_or_neg_one": "int",
-    "constant_zero_int":      "int",
-    "constant_zero_long":     "int",
-    "convert_num_to_bool":    "bool",
-    "convert_truthy_bool":    "bool",
-    "constant_false_bool":    "bool",
-    "constant_zero_float":    "float",
-    "convert_str_to_list":    "list",
-    "compose_jackpot_menu_items_ids": "list",
-    "parse_menu_items_ids":   "list",
-    "compose_chip_count_left_freespins": "int",
-    "convert_time_to_string": "str",
-    "convert_time_to_date_as_string": "str",
-    "convert_yymmdd_to_iso":  "str",
-    "compose_expiration_from_days":   "str",
-}
-
-# Per-field kind overrides applied after the lambda lookup. Defaults retained
-# for backwards-compat with existing PLAYERBONUS docs whose ES mapping diverges
-# from the template lambdas. Per-event YAML key `FIELD_KIND_OVERRIDES:` adds
-# (or replaces) overrides for that event only.
-_DEFAULT_FIELD_KIND_OVERRIDE = {
-    "parentId":                 "int_str",  # ES=keyword, lambdas emit int
-    "maxWin":                   "int_str",  # ES=keyword, lambdas emit int
-    "triggeringTransactionId":  "int",      # ES=integer, mapping lambda empty -> str fallback
-}
-
-
-def field_types(mapping_rows: list[dict],
-                overrides: dict[str, str] | None = None) -> dict[str, str]:
-    """{filed_es -> coerce_kind} where kind is one of int/float/bool/list/str/str_int.
-
-    When the same ES field is declared in multiple templates with different
-    lambdas, prefer the strongest kind: never let a "str" fallback overwrite
-    an already-seen typed kind (float/int/bool/list/...).
-    """
-    out: dict[str, str] = {}
-    for r in mapping_rows:
-        fe = (r.get("filed_es") or "").strip()
-        if not fe:
-            continue
-        fn = (r.get("funciton_lambda") or "").strip()
-        kind = _LAMBDA_TYPE.get(fn, "str")
-        if kind != "str" or fe not in out:
-            out[fe] = kind
-    final_overrides = {**_DEFAULT_FIELD_KIND_OVERRIDE, **(overrides or {})}
-    for fe, kind in final_overrides.items():
-        if fe in out:
-            out[fe] = kind
-    return out
-
-
-# ES date mapping uses "yyyy-MM-dd'T'HH:mm:ss.SSS"; pipeline lambdas emit
-# "YYYY-MM-DD HH:MM:SS.fff" (space). Swap space → 'T' just before send.
-_ISO_DT_SPACE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$")
-
-
-def coerce(value: str, kind: str):
-    """String CSV value -> ES-typed value. Empty/None handled."""
-    if value is None:
-        return None
-    s = value.strip() if isinstance(value, str) else value
-    if s == "" or (isinstance(s, str) and s.lower() in ("none", "nan", "<na>", "null")):
-        return None
-    if kind in ("int", "str_int"):
-        try:
-            return int(float(s))
-        except (TypeError, ValueError):
-            return None
-    if kind == "int_str":
-        try:
-            return str(int(float(s)))
-        except (TypeError, ValueError):
-            return None
-    if kind == "float":
-        try:
-            return float(s)
-        except (TypeError, ValueError):
-            return None
-    if kind == "bool":
-        if isinstance(s, str):
-            return s.strip().lower() in ("1", "true", "yes", "t", "y")
-        return bool(s)
-    if kind == "list":
-        if isinstance(s, list):
-            return s
-        if isinstance(s, str) and s.startswith("[") and s.endswith("]"):
-            try:
-                v = ast.literal_eval(s)
-                return list(v) if isinstance(v, (list, tuple)) else [v]
-            except (ValueError, SyntaxError):
-                return [p.strip() for p in s.strip("[]").split(",") if p.strip()]
-        if isinstance(s, str) and "," in s:
-            return [p.strip() for p in s.split(",") if p.strip()]
-        return [s]
-    out = str(s)
-    if _ISO_DT_SPACE_RE.match(out):
-        return out.replace(" ", "T", 1)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +198,9 @@ def wait_task(url, task_id, auth, verify) -> dict:
 # Mode A: apply field-level diffs (changes_*.csv)
 # ---------------------------------------------------------------------------
 
-def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
+def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
                   url: str, auth, verify: bool, dry: bool,
                   audit: "AuditLog | None" = None,
-                  stamp_update_date: bool = False,
                   schema: dict[str, dict] | None = None,
                   event: str | None = None, env: str | None = None,
                   force: bool = False, run_id: str | None = None,
@@ -344,8 +226,7 @@ def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
                 field = (r.get("field") or "").strip()
                 if not doc_id or not field or field == "*":
                     continue
-                kind = types.get(field, "str")
-                new_val = coerce(r.get("oracle_value"), kind)
+                new_val = adapter.coerce_for_es(field, r.get("oracle_value"))
                 old_val = r.get("es_value")
                 docs.setdefault(doc_id, {})[field] = new_val
                 audit_changes.setdefault(doc_id, {})[field] = {"old": old_val, "new": new_val}
@@ -378,8 +259,7 @@ def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
                 field = (row.get("field") or "").strip()
                 if not doc_id or not field or field == "*":
                     continue
-                kind = types.get(field, "str")
-                new_val = coerce(row.get("oracle_value"), kind)
+                new_val = adapter.coerce_for_es(field, row.get("oracle_value"))
                 old_val = row.get("es_value")
                 docs.setdefault(doc_id, {})[field] = new_val
                 audit_changes.setdefault(doc_id, {})[field] = {"old": old_val, "new": new_val}
@@ -392,13 +272,9 @@ def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
           f"(across {len(file_doc_ids)} source file(s), "
           f"source={'postgres' if use_pg else 'csv'})")
 
-    # Pre-flight schema validation across the whole plan (incl. stamped updateDate).
+    # Pre-flight schema validation across the whole plan (incl. adapter-added fields).
     if schema:
-        preview = {did: dict(fields) for did, fields in docs.items()}
-        if stamp_update_date:
-            sample_now = _now_es_iso()
-            for d in preview.values():
-                d["updateDate"] = sample_now
+        preview = {did: adapter.before_apply(dict(fields)) for did, fields in docs.items()}
         errors: list[str] = []
         for did, fields in preview.items():
             errors.extend(es_schema_io.validate_doc(did, fields, schema))
@@ -423,12 +299,13 @@ def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
     batches = (len(ids) + BATCH_SIZE - 1) // BATCH_SIZE
     for i in range(0, len(ids), BATCH_SIZE):
         chunk_ids = ids[i:i + BATCH_SIZE]
-        chunk_map = {k: dict(docs[k]) for k in chunk_ids}
-        if stamp_update_date:
-            now_iso = _now_es_iso()
-            for k in chunk_ids:
-                chunk_map[k]["updateDate"] = now_iso
-                audit_changes.setdefault(k, {})["updateDate"] = {"old": None, "new": now_iso}
+        chunk_map: dict[str, dict] = {}
+        for k in chunk_ids:
+            before = dict(docs[k])
+            after = adapter.before_apply(before)
+            chunk_map[k] = after
+            for added in set(after.keys()) - set(docs[k].keys()):
+                audit_changes.setdefault(k, {})[added] = {"old": None, "new": after[added]}
         body = {
             "query": {"terms": {"_id": chunk_ids}},
             "script": {
@@ -485,10 +362,9 @@ def apply_changes(changes_dir: Path, index: str, types: dict[str, str], pk: str,
 # Mode B: insert missing docs (missing_in_es_*.csv) — never overwrite
 # ---------------------------------------------------------------------------
 
-def apply_missing(changes_dir: Path, index: str, types: dict[str, str], pk: str,
+def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
                   url: str, auth, verify: bool, dry: bool,
                   audit: "AuditLog | None" = None,
-                  stamp_update_date: bool = False,
                   schema: dict[str, dict] | None = None,
                   event: str | None = None, env: str | None = None,
                   force: bool = False, run_id: str | None = None,
@@ -549,12 +425,11 @@ def apply_missing(changes_dir: Path, index: str, types: dict[str, str], pk: str,
             continue
         body = {}
         for field, raw in r.items():
-            v = coerce(raw, types.get(field, "str"))
+            v = adapter.coerce_for_es(field, raw)
             if v is None:
                 continue
             body[field] = v
-        if stamp_update_date:
-            body["updateDate"] = _now_es_iso()
+        body = adapter.before_apply(body)
         docs.append((doc_id, body))
 
     if schema:
@@ -662,9 +537,12 @@ def main():
         sys.exit(f"event {args.event}: INDEX_NAME is empty")
     pk = entry.get("PK") or "id"
     mapping_rows = collect_mapping_rows(entry)
-    overrides = entry.get("FIELD_KIND_OVERRIDES") or {}
+
+    adapter = get_adapter(index)
+    overrides = {**adapter.field_kind_overrides(), **(entry.get("FIELD_KIND_OVERRIDES") or {})}
     types = field_types(mapping_rows, overrides=overrides)
     types[pk] = "str"  # PK as-is
+    adapter.bind_field_types(types)
 
     changes_dir = OUT_DIR / args.event / args.env / "changes"
     if not changes_dir.is_dir() and args.source == "csv":
@@ -673,12 +551,9 @@ def main():
 
     url, auth, verify = es_client(args.env)
     print(f"event={args.event} index={index} pk={pk} env={args.env} url={url} dry={args.dry}")
+    print(f"adapter={type(adapter).__module__}.{type(adapter).__name__}")
     print(f"changes dir: {changes_dir}")
     print(f"types known for {len(types)} fields")
-
-    stamp_update_date = bool(entry.get("STAMP_UPDATE_DATE", False))
-    if stamp_update_date:
-        print(f"STAMP_UPDATE_DATE=on → every doc op will set updateDate=now()")
 
     # Auto-refresh ES schema CSV from prod (always prod regardless of --env).
     schema_csv = schema_csv_path(index)
@@ -707,13 +582,13 @@ def main():
     audit = None if args.dry else AuditLog(args.env, args.event, index)
     try:
         if args.mode in ("changes", "both"):
-            apply_changes(changes_dir, index, types, pk, url, auth, verify, args.dry, audit,
-                          stamp_update_date, schema,
+            apply_changes(changes_dir, index, adapter, pk, url, auth, verify, args.dry, audit,
+                          schema,
                           event=args.event, env=args.env, force=args.force, run_id=run_id,
                           data_source=args.source)
         if args.mode in ("missing", "both"):
-            apply_missing(changes_dir, index, types, pk, url, auth, verify, args.dry, audit,
-                          stamp_update_date, schema,
+            apply_missing(changes_dir, index, adapter, pk, url, auth, verify, args.dry, audit,
+                          schema,
                           event=args.event, env=args.env, force=args.force, run_id=run_id,
                           data_source=args.source)
     finally:
