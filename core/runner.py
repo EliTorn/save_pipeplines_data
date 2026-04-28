@@ -9,6 +9,7 @@ from pathlib import Path
 from connect_into_orcal.connect_to_orcal import create_connection
 from connect_into_orcal.logging_setup import QueueLogger, start_log_listener
 from connect_into_es.connect_to_es import es_time_field
+from core.adapter_loader import get_adapter
 from core.batch import (
     DEFAULT_BATCH_SIZE, Plan, add_time_filter, batch_id_range, batch_time, batch_time_union,
     count_id_windows, count_windows, es_entry_for, event_dir, fmt_ts, id_windows,
@@ -119,6 +120,7 @@ def run_event_time(conn, event: str, entry: dict, logger, pool) -> None:
     es_entry = es_entry_for(entry)
     pk = entry["PK"]
 
+    adapter = get_adapter(index)
     total = count_windows(start, end, step_td)
     print(f"[{event}] env={env} {fmt_ts(start)} -> {fmt_ts(end)} step={entry.get('BANCH_VALUE')} "
           f"index={index} es_field={es_time_field(es_entry)} batches={total} workers={PIPELINE_WORKERS}")
@@ -131,6 +133,7 @@ def run_event_time(conn, event: str, entry: dict, logger, pool) -> None:
             "sql": sql, "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "w_from": w_from, "w_to": w_to, "batch_idx": i,
+            "adapter": adapter,
         },
     } for i, (w_from, w_to) in enumerate(windows(start, end, step_td), 1)]
     _execute_tasks(pool, tasks, event, total)
@@ -162,6 +165,7 @@ def run_event_id_range(conn, event: str, entry: dict, logger, pool) -> None:
     print(f"[{event}] env={env} id_range min={min_id} max={max_id} step={step} limit={limit} "
           f"index={index} pk={pk} batches={total} workers={PIPELINE_WORKERS}")
 
+    adapter = get_adapter(index)
     batch_sql = sections["batch"]
     tasks = [{
         "kind": "id_range",
@@ -171,6 +175,7 @@ def run_event_id_range(conn, event: str, entry: dict, logger, pool) -> None:
             "batch_sql": batch_sql, "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "from_id": from_id, "to_id": to_id, "batch_idx": i,
+            "adapter": adapter,
         },
     } for i, (from_id, to_id) in enumerate(id_windows(min_id, max_id, step, limit), 1)]
     _execute_tasks(pool, tasks, event, total)
@@ -202,6 +207,7 @@ def run_event_time_union(conn, event: str, entry: dict, logger, pool) -> None:
         "raw_part": part,
     } for part in parts]
 
+    adapter = get_adapter(index)
     total = count_windows(start, end, step_td)
     print(f"[{event}] env={env} {fmt_ts(start)} -> {fmt_ts(end)} step={entry.get('BANCH_VALUE')} "
           f"index={index} parts={len(parts)} es_field={es_time_field(es_entry)} batches={total} "
@@ -215,6 +221,7 @@ def run_event_time_union(conn, event: str, entry: dict, logger, pool) -> None:
             "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "w_from": w_from, "w_to": w_to, "batch_idx": i,
+            "adapter": adapter,
         },
     } for i, (w_from, w_to) in enumerate(windows(start, end, step_td), 1)]
     _execute_tasks(pool, tasks, event, total)

@@ -280,7 +280,7 @@ def _apply_lookup(shaped: pd.DataFrame, df_raw: pd.DataFrame, part: dict, conn, 
 # ---------------------------------------------------------------------------
 
 def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
-               sql, pk, index, event_dir_str, w_from, w_to, batch_idx):
+               sql, pk, index, event_dir_str, w_from, w_to, batch_idx, adapter=None):
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
@@ -288,7 +288,7 @@ def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
 
     df_ora, qid = run_tracked(conn, sql, params, logger, table=event, batch=batch_idx)
     df_ora = plan.filter_oracle(df_ora)
-    shaped_ora = transform_to_es_shape(df_ora, plan.mapping)
+    shaped_ora = transform_to_es_shape(df_ora, plan.mapping, adapter=adapter)
     save_oracle_csv(shaped_ora, ev_dir / f"{event}_oracle_{stamp}.csv",
                     event, batch_idx, logger, query_id=qid)
 
@@ -298,14 +298,14 @@ def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
     df_es = plan.filter_es(df_es)
     save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
 
-    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk),
+    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
                ev_dir, stamp, event, batch_idx, logger,
                shaped_ora=shaped_ora, pk=pk)
     return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es)}
 
 
 def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
-                   batch_sql, pk, index, event_dir_str, from_id, to_id, batch_idx):
+                   batch_sql, pk, index, event_dir_str, from_id, to_id, batch_idx, adapter=None):
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_id": from_id, "to_id": to_id}
@@ -313,7 +313,7 @@ def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
 
     df_ora, qid = run_tracked(conn, batch_sql, params, logger, table=event, batch=batch_idx)
     df_ora = plan.filter_oracle(df_ora)
-    shaped_ora = transform_to_es_shape(df_ora, plan.mapping)
+    shaped_ora = transform_to_es_shape(df_ora, plan.mapping, adapter=adapter)
     save_oracle_csv(shaped_ora, ev_dir / f"{event}_oracle_{stamp}.csv",
                     event, batch_idx, logger, query_id=qid)
 
@@ -324,14 +324,14 @@ def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
     df_es = plan.filter_es(df_es)
     save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
 
-    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk),
+    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
                ev_dir, stamp, event, batch_idx, logger,
                shaped_ora=shaped_ora, pk=pk)
     return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es)}
 
 
 def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
-                     allowed, pk, index, event_dir_str, w_from, w_to, batch_idx):
+                     allowed, pk, index, event_dir_str, w_from, w_to, batch_idx, adapter=None):
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
     stamp = w_from.strftime("%Y%m%d_%H%M%S")
@@ -343,7 +343,7 @@ def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
         df_raw, _ = run_tracked(conn, prep["sql"], params, logger,
                                 table=f"{event}::part{j}", batch=batch_idx)
         total_raw += len(df_raw)
-        shaped = transform_to_es_shape(df_raw, prep["mapping"])
+        shaped = transform_to_es_shape(df_raw, prep["mapping"], adapter=adapter)
         shaped = _apply_lookup(shaped, df_raw, prep["raw_part"], conn, logger)
         shaped_parts.append(shaped)
 

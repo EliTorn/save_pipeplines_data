@@ -1,106 +1,52 @@
+"""Mapping -> ES-shape transform + Oracle/ES diff.
+
+Lambda registry `LAMBDAS` is the union of common_lambdas + every per-index
+adapter's lambdas, assembled explicitly here (no auto-registration).
+Pass `adapter=` to scope a transform to one index's lambdas.
+"""
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from utils_lambda import (
-    convert_time_to_string,
-    convert_num_to_bool,
-    convert_int_to_string,
-    convert_str_to_list,
-    convert_yymmdd_to_iso,
-    convert_last_four,
-    convert_wallet_type_to_payment_system,
-    compose_apple_pay_id,
-    convert_regular_id,
-    convert_first_six,
-    convert_blacklist_to_iswhitelisted,
-    convert_blacklist_to_isblacklisted,
-    convert_verified_to_isverified,
-    compose_regular_expiry_date,
-    constant_regular_payment_system,
-    compose_playerbonus_redeem_id,
-    compose_playerbonus_wheelspin_id,
-    compose_playerbonus_jackpot_id,
-    compose_playerbonus_freespins_id,
-    convert_int_or_zero,
-    convert_int_or_neg_one,
-    convert_truthy_bool,
-    constant_zero_int,
-    constant_zero_float,
-    convert_to_int_strict,
-    compose_expiration_from_days,
-    constant_bonus_type_redeem,
-    constant_bonus_type_wheelspin,
-    constant_bonus_type_jackpot,
-    compose_bonus_type_freespins,
-    lookup_bonus_status_redeem,
-    lookup_bonus_status_freespins,
-    lookup_bonus_status_wheelspin,
-    lookup_bonus_status_jackpot,
-    lookup_skin_group,
-    lookup_skin_origin,
-    compose_worth_freespins_wheelspin,
-    compose_chip_count_left_freespins,
-    parse_menu_items_ids,
-    compose_jackpot_menu_items_ids,
-    constant_class_playerbonus,
-    constant_false_bool,
-    constant_zero_long,
-)
+from core.adapter_loader import known_indexes
+from settings.common_lambdas import COMMON_LAMBDAS
 
-LAMBDAS = {
-    "convert_time_to_string": convert_time_to_string,
-    "convert_num_to_bool": convert_num_to_bool,
-    "convert_int_to_string": convert_int_to_string,
-    "convert_str_to_list": convert_str_to_list,
-    "convert_yymmdd_to_iso": convert_yymmdd_to_iso,
-    "convert_last_four": convert_last_four,
-    "convert_wallet_type_to_payment_system": convert_wallet_type_to_payment_system,
-    "compose_apple_pay_id": compose_apple_pay_id,
-    "convert_regular_id": convert_regular_id,
-    "convert_first_six": convert_first_six,
-    "convert_blacklist_to_iswhitelisted": convert_blacklist_to_iswhitelisted,
-    "convert_blacklist_to_isblacklisted": convert_blacklist_to_isblacklisted,
-    "convert_verified_to_isverified": convert_verified_to_isverified,
-    "compose_regular_expiry_date": compose_regular_expiry_date,
-    "constant_regular_payment_system": constant_regular_payment_system,
-    "compose_playerbonus_redeem_id": compose_playerbonus_redeem_id,
-    "compose_playerbonus_wheelspin_id": compose_playerbonus_wheelspin_id,
-    "compose_playerbonus_jackpot_id": compose_playerbonus_jackpot_id,
-    "compose_playerbonus_freespins_id": compose_playerbonus_freespins_id,
-    "convert_int_or_zero": convert_int_or_zero,
-    "convert_int_or_neg_one": convert_int_or_neg_one,
-    "convert_truthy_bool": convert_truthy_bool,
-    "constant_zero_int": constant_zero_int,
-    "constant_zero_float": constant_zero_float,
-    "convert_to_int_strict": convert_to_int_strict,
-    "compose_expiration_from_days": compose_expiration_from_days,
-    "constant_bonus_type_redeem": constant_bonus_type_redeem,
-    "constant_bonus_type_wheelspin": constant_bonus_type_wheelspin,
-    "constant_bonus_type_jackpot": constant_bonus_type_jackpot,
-    "compose_bonus_type_freespins": compose_bonus_type_freespins,
-    "lookup_bonus_status_redeem": lookup_bonus_status_redeem,
-    "lookup_bonus_status_freespins": lookup_bonus_status_freespins,
-    "lookup_bonus_status_wheelspin": lookup_bonus_status_wheelspin,
-    "lookup_bonus_status_jackpot": lookup_bonus_status_jackpot,
-    "lookup_skin_group": lookup_skin_group,
-    "lookup_skin_origin": lookup_skin_origin,
-    "compose_worth_freespins_wheelspin": compose_worth_freespins_wheelspin,
-    "compose_chip_count_left_freespins": compose_chip_count_left_freespins,
-    "parse_menu_items_ids": parse_menu_items_ids,
-    "compose_jackpot_menu_items_ids": compose_jackpot_menu_items_ids,
-    "constant_class_playerbonus": constant_class_playerbonus,
-    "constant_false_bool": constant_false_bool,
-    "constant_zero_long": constant_zero_long,
-}
+if TYPE_CHECKING:
+    from core.adapter import IndexAdapter
+
+
+def _build_union_lambdas() -> dict:
+    """Union of common + every known adapter's lambdas (explicit, no side-effect)."""
+    out: dict = dict(COMMON_LAMBDAS)
+    from core.adapter_loader import get_adapter
+    for idx in known_indexes():
+        try:
+            out.update(get_adapter(idx).lambdas())
+        except Exception as e:
+            print(f"[compare] WARN: failed to load adapter for {idx}: {e}")
+    return out
+
+
+LAMBDAS = _build_union_lambdas()
 
 _BAD_PK_VALUES = {"", "none", "nan", "<na>", "null"}
 
 
-def transform_to_es_shape(df_raw: "pd.DataFrame", mapping: list[dict]) -> "pd.DataFrame":
+def _resolve_lambdas(adapter: "IndexAdapter | None") -> dict:
+    if adapter is None:
+        return LAMBDAS
+    return {**COMMON_LAMBDAS, **adapter.lambdas()}
+
+
+def transform_to_es_shape(df_raw: "pd.DataFrame", mapping: list[dict],
+                          adapter: "IndexAdapter | None" = None) -> "pd.DataFrame":
     """Build a new DataFrame keyed by `filed_es` names with lambda-transformed values.
-    Mapping rows with empty `filed_orcal` produce empty columns (e.g. isWhitelisted/bin)."""
-    df = apply_composite_mappings(df_raw, mapping)
+    Mapping rows with empty `filed_orcal` produce empty columns (e.g. isWhitelisted/bin).
+    Pass `adapter=` to scope lookups to one index; default uses the union registry."""
+    lambdas = _resolve_lambdas(adapter)
+    df = apply_composite_mappings(df_raw, mapping, adapter=adapter)
     out = pd.DataFrame()
     n = len(df)
     for m in mapping:
@@ -110,7 +56,7 @@ def transform_to_es_shape(df_raw: "pd.DataFrame", mapping: list[dict]) -> "pd.Da
         if not fe:
             continue
         if not fo:
-            fn = LAMBDAS.get(fn_name) if fn_name else None
+            fn = lambdas.get(fn_name) if fn_name else None
             out[fe] = [fn(None) if fn else None] * n
             continue
         if "+" in fo:
@@ -120,7 +66,7 @@ def transform_to_es_shape(df_raw: "pd.DataFrame", mapping: list[dict]) -> "pd.Da
             out[fe] = [None] * n
             continue
         col = df[fo]
-        fn = LAMBDAS.get(fn_name) if fn_name else None
+        fn = lambdas.get(fn_name) if fn_name else None
         if fn:
             out[fe] = col.apply(lambda v, _fn=fn: _fn(v))
         else:
@@ -128,9 +74,11 @@ def transform_to_es_shape(df_raw: "pd.DataFrame", mapping: list[dict]) -> "pd.Da
     return out
 
 
-def apply_composite_mappings(df: pd.DataFrame, mapping: list[dict]) -> pd.DataFrame:
+def apply_composite_mappings(df: pd.DataFrame, mapping: list[dict],
+                             adapter: "IndexAdapter | None" = None) -> pd.DataFrame:
     """For mapping entries with multi-col filed_orcal (e.g. 'WALLET_TYPE+DPAN_ID'),
     call the lambda with a row dict and store result in df[filed_es]."""
+    lambdas = _resolve_lambdas(adapter)
     df = df.copy()
     for m in mapping:
         fo = (m.get("filed_orcal") or "").strip()
@@ -138,7 +86,7 @@ def apply_composite_mappings(df: pd.DataFrame, mapping: list[dict]) -> pd.DataFr
         fn_name = (m.get("funciton_lambda") or "").strip()
         if "+" not in fo or not fe or not fn_name:
             continue
-        fn = LAMBDAS.get(fn_name)
+        fn = lambdas.get(fn_name)
         if fn is None:
             continue
         cols = [c.strip() for c in fo.split("+")]
@@ -173,7 +121,6 @@ def _equal(a, b):
         return False
     if isinstance(a, bool) or isinstance(b, bool):
         return bool(a) == bool(b)
-    # numeric equivalence: 50 == 50.0 == "50" == "50.0"
     try:
         return float(a) == float(b)
     except (TypeError, ValueError):
@@ -239,10 +186,11 @@ def compare_shaped(shaped: pd.DataFrame, df_es: pd.DataFrame,
 
 
 def compare_records(df_ora: pd.DataFrame, df_es: pd.DataFrame,
-                    mapping: list[dict], pk: str) -> pd.DataFrame:
+                    mapping: list[dict], pk: str,
+                    adapter: "IndexAdapter | None" = None) -> pd.DataFrame:
     if df_ora.empty or df_es.empty or pk not in df_es.columns:
         return pd.DataFrame(columns=[pk, "field", "oracle_value", "es_value", "status"])
-    shaped = transform_to_es_shape(df_ora, mapping)
+    shaped = transform_to_es_shape(df_ora, mapping, adapter=adapter)
     if pk not in shaped.columns:
         return pd.DataFrame(columns=[pk, "field", "oracle_value", "es_value", "status"])
     fields = [(m.get("filed_es") or "").strip() for m in mapping
