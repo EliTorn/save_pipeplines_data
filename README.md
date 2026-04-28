@@ -6,6 +6,7 @@ diffs back into ES.
 
 ## How to add a new index
 
+
 Adding a new index requires only files inside one folder:
 
 ```
