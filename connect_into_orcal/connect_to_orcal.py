@@ -56,8 +56,11 @@ def run_query(conn: oracledb.Connection, sql: str, params: dict | None = None,
 
 def run_tracked(conn, sql: str, params: dict | None, logger,
                 owner: str | None = None, table: str | None = None,
-                batch: int | None = None) -> tuple[pd.DataFrame, str]:
-    with logger.query(sql, owner=owner, table=table, batch=batch, params=params) as q:
+                batch: int | None = None,
+                env: str | None = None,
+                operation: str = "oracle_select") -> tuple[pd.DataFrame, str]:
+    with logger.query(sql, owner=owner, table=table, batch=batch, params=params,
+                      env=env, operation=operation) as q:
         df = run_query(conn, sql, params)
         q.set_rows(len(df))
     return df, q.query_id

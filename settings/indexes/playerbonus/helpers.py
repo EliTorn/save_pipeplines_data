@@ -167,6 +167,59 @@ def compose_worth_freespins_wheelspin(row: dict) -> float:
         return 0.0
 
 
+def compose_twister_prize_won(row: dict) -> bool:
+    """{STATUSID, PRIZETYPE, AMOUNTWON, PRIZE_FREESPINS} -> bool.
+
+    Mirrors Java EventManager.sendJackpotWheelEndEvent prizeWon logic:
+      Only set true when the JackpotWheel reached END (statusId == 4 = Closed).
+      Per JackpotWheelSegmentType (id):
+        1 FREE_SPINS    -> prize template freeSpins > 0
+        2 CASH_BONUS    -> userJackpotWheel.amountWon > 0
+        4 MEGA_JACKPOT  -> amountWon > 0
+        5 MIDI_JACKPOT  -> amountWon > 0
+        6 MINI_JACKPOT  -> amountWon > 0
+        9 BINGO_TICKET  -> amountWon > 0  (proxy; Java uses bingoTicket.freeTickets)
+        10 SCRATCH_CARD -> amountWon > 0  (proxy; Java uses scratchCard.freeTickets)
+        3 NO_PRIZE / 7 LEVEL_UP / 8 TICKET_TO_MEGA_LOTTERY / null -> false
+    """
+    if row is None:
+        return False
+    if _to_int_or(row.get("STATUSID"), -1) != 4:
+        return False
+    pt = _to_int_or(row.get("PRIZETYPE"), -1)
+    if pt == 1:
+        try:
+            return int(row.get("PRIZE_FREESPINS") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    if pt in (2, 4, 5, 6, 9, 10):
+        try:
+            return float(row.get("AMOUNTWON") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def compose_freespins_left(row: dict) -> Optional[int]:
+    """{SPECIALBONUSTYPEID, FREESPINS_LEFT} -> int for FreeSpins (sid != 4); None for FreeChips (sid == 4).
+
+    Mirrors Java EventManagerService.buildFreeSpinsBonusFields:
+      .freeSpinsLeft(freeChips ? null : freeSpinsUserBonus.getFreeSpinsLeft())
+    """
+    if row is None:
+        return None
+    sid = _to_int_or(row.get("SPECIALBONUSTYPEID"), 1)
+    if sid == 4:
+        return None
+    fsl = row.get("FREESPINS_LEFT")
+    if _is_nan_or_none(fsl):
+        return None
+    try:
+        return int(fsl)
+    except (TypeError, ValueError):
+        return None
+
+
 def compose_chip_count_left_freespins(row: dict) -> Optional[int]:
     """{SPECIALBONUSTYPEID, FREESPINS_LEFT} -> FREESPINS_LEFT if FreeChips (4); 0 for FS; None otherwise."""
     if row is None:
@@ -258,6 +311,8 @@ _PLAYERBONUS_LAMBDAS = {
     "compose_expiration_from_days": compose_expiration_from_days,
     "compose_worth_freespins_wheelspin": compose_worth_freespins_wheelspin,
     "compose_chip_count_left_freespins": compose_chip_count_left_freespins,
+    "compose_freespins_left": compose_freespins_left,
+    "compose_twister_prize_won": compose_twister_prize_won,
     "constant_bonus_type_redeem": constant_bonus_type_redeem,
     "constant_bonus_type_wheelspin": constant_bonus_type_wheelspin,
     "constant_bonus_type_jackpot": constant_bonus_type_jackpot,

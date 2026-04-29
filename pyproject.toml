@@ -25,6 +25,8 @@ streamlit = ">=1.30"
 tqdm = ">=4.66"
 oracledb = ">=2.0"
 psycopg = {version = ">=3.1", extras = ["binary"]}
+pyarrow = ">=15.0"
+duckdb = ">=1.0"
 
 [tool.poetry.group.dev.dependencies]
 # add lint/test tooling here as needed

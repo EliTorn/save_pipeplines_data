@@ -38,7 +38,7 @@ EVENT_FIELDS = [
 ]
 
 QUERY_FIELDS = [
-    "query_id", "run_id", "sql_hash",
+    "query_id", "run_id", "env", "operation", "sql_hash",
     "start_ts", "start_ts_local", "tz",
     "start_date", "start_hour", "start_minute", "start_weekday",
     "start_day_name", "start_week", "start_month", "start_year",
@@ -52,6 +52,23 @@ QUERY_FIELDS = [
 ]
 
 _lock = threading.Lock()
+
+
+def _pg_mirror_connection(row: dict, system_name: str) -> None:
+    """Best-effort PG mirror. Never raises."""
+    try:
+        from connect_into_postgres import observability
+        observability.from_connection_row(row, system_name)
+    except Exception:
+        pass
+
+
+def _pg_mirror_query(row: dict, system_name: str) -> None:
+    try:
+        from connect_into_postgres import observability
+        observability.from_query_row(row, system_name)
+    except Exception:
+        pass
 
 
 def _append_row(path: Path, fields: list[str], row: dict) -> None:
@@ -94,13 +111,16 @@ def _sql_hash(sql: str) -> str:
 
 class QueryRecord:
     def __init__(self, logger: "RunLoggerBase", sql: str, owner=None, table=None,
-                 batch=None, params=None):
+                 batch=None, params=None, env: str | None = None,
+                 operation: str | None = None):
         self.logger = logger
         self.sql = sql
         self.owner = owner
         self.table = table
         self.batch = batch
         self.params = params
+        self.env = env
+        self.operation = operation
         self.rows: int | None = None
         self.query_id = uuid.uuid4().hex[:12]
         self.sql_hash = _sql_hash(sql)
@@ -126,6 +146,8 @@ class QueryRecord:
         return {
             "query_id": self.query_id,
             "run_id": self.logger.run_id,
+            "env": self.env,
+            "operation": self.operation,
             "sql_hash": self.sql_hash,
             "tz": self._tz,
             **_time_breakdown(self._start_utc, self._start_local, "start"),
@@ -144,7 +166,9 @@ class QueryRecord:
         }
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        _append_row(self.logger.QUERIES_CSV, QUERY_FIELDS, self._build_row(exc))
+        row = self._build_row(exc)
+        _append_row(self.logger.QUERIES_CSV, QUERY_FIELDS, row)
+        _pg_mirror_query(row, getattr(self.logger, "SYSTEM_NAME", "unknown"))
         return False
 
 
@@ -165,6 +189,7 @@ class RunLoggerBase:
     CONN_FIELDS: list[str]
     PREFIX: str = ""
     CONN_PRINT_VERBOSE_ONLY: bool = False  # postgres overrides to True
+    SYSTEM_NAME: str = "unknown"  # subclass override: oracle / elasticsearch / postgres
 
     def __init__(self, run_id: str):
         self.run_id = run_id
@@ -172,6 +197,7 @@ class RunLoggerBase:
     def connection(self, **fields) -> None:
         row = {"run_id": self.run_id, **_time_fields(), **fields}
         _append_row(self.CONN_CSV, self.CONN_FIELDS, row)
+        _pg_mirror_connection(row, self.SYSTEM_NAME)
         if not self.CONN_PRINT_VERBOSE_ONLY or _VERBOSE:
             print(f"[{self.PREFIX}{self.run_id}] connection -> {self.CONN_CSV.name}")
 
@@ -195,8 +221,10 @@ class RunLoggerBase:
                              if k in ("owner", "table", "batch", "rows", "seconds", "error"))
             print(f"[{self.PREFIX}{self.run_id}] {event} {short}".rstrip())
 
-    def query(self, sql: str, owner=None, table=None, batch=None, params=None) -> QueryRecord:
-        return QueryRecord(self, sql, owner=owner, table=table, batch=batch, params=params)
+    def query(self, sql: str, owner=None, table=None, batch=None, params=None,
+              env: str | None = None, operation: str | None = None) -> QueryRecord:
+        return QueryRecord(self, sql, owner=owner, table=table, batch=batch,
+                           params=params, env=env, operation=operation)
 
 
 class QueueLogger:
@@ -213,13 +241,17 @@ class QueueLogger:
             "event": event, "level": level, "query_id": query_id, **fields,
         }))
 
-    def query(self, sql: str, owner=None, table=None, batch=None, params=None) -> QueueQueryRecord:
-        return QueueQueryRecord(self, sql, owner=owner, table=table, batch=batch, params=params)
+    def query(self, sql: str, owner=None, table=None, batch=None, params=None,
+              env: str | None = None, operation: str | None = None) -> QueueQueryRecord:
+        return QueueQueryRecord(self, sql, owner=owner, table=table, batch=batch,
+                                params=params, env=env, operation=operation)
 
 
 def start_log_listener(queue, parent_logger: RunLoggerBase) -> threading.Thread:
     """Spawn a daemon thread in the parent that drains queue and writes via
     `parent_logger`. Send `None` to stop. Returns the thread."""
+    system = getattr(parent_logger, "SYSTEM_NAME", "unknown")
+
     def _run():
         while True:
             msg = queue.get()
@@ -230,6 +262,7 @@ def start_log_listener(queue, parent_logger: RunLoggerBase) -> threading.Thread:
                 parent_logger.event(**payload)
             elif kind == "query_row":
                 _append_row(parent_logger.QUERIES_CSV, QUERY_FIELDS, payload)
+                _pg_mirror_query(payload, system)
     t = threading.Thread(target=_run, name="log-listener", daemon=True)
     t.start()
     return t

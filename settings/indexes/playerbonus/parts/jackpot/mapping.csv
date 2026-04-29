@@ -34,4 +34,4 @@ TRIGGERING_CAUSE,triggeringCause,
 ,prizeWon,constant_zero_float
 ,maxWin,constant_zero_int
 ,worth,constant_zero_float
-,twisterPrizeWon,constant_false_bool
+STATUSID+PRIZETYPE+AMOUNTWON+PRIZE_FREESPINS,twisterPrizeWon,compose_twister_prize_won

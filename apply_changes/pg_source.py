@@ -1,35 +1,33 @@
-"""Pull unapplied diffs / missing rows from Postgres so apply_changes doesn't
-need local CSV files.
+"""LEGACY fallback: pull unapplied diffs/missing rows from the legacy PG
+heavy tables so `apply_changes --source pg` keeps working against historical
+data.
 
-Source of truth (when CSVs have been cleaned up by sync_out):
-    pipeline_changes WHERE applied_ts IS NULL AND status = 'diff'
-    pipeline_missing WHERE applied_ts IS NULL
+Phase C+ status:
+  - The active flow writes diffs/missing only to local Parquet, never to PG.
+  - `apply_changes` defaults to `--source duckdb`. This module is selected
+    only by `--source pg` or as the first step of `--source auto`.
+  - Used as: `pipeline_changes WHERE applied_ts IS NULL` /
+             `pipeline_missing WHERE applied_ts IS NULL`.
 
 Reconstructs CSV-shaped dicts so the existing apply_changes logic can iterate
-unchanged. Each dict has the same keys as the original `changes_*.csv` /
-`missing_in_es_*.csv` rows.
+unchanged. Each dict has the same keys as `changes_*.csv` / `missing_in_es_*.csv`
+rows.
 """
 from __future__ import annotations
 
 import json
 
-# Cached lazy connection (mirrors pg_tracking.py behavior).
-_conn = None
-_pg_failed = False
+from connect_into_postgres._pg_cache import CachedConnection
+
+_cache = CachedConnection("pg-source")
 
 
 def _get_conn():
-    global _conn, _pg_failed
-    if _conn is not None or _pg_failed:
-        return _conn
-    try:
-        from connect_into_postgres import connect_to_postgres as pg
-        _conn = pg.create_connection()
-    except (Exception, SystemExit) as e:
-        print(f"[pg-source] disabled: {type(e).__name__}: {e}")
-        _pg_failed = True
-        _conn = None
-    return _conn
+    return _cache.get()
+
+
+def reset_state() -> None:
+    _cache.reset()
 
 
 def is_available() -> bool:
@@ -211,8 +209,4 @@ def source_files_for_missing(event: str, env: str) -> set[str]:
 
 
 def close() -> None:
-    global _conn
-    if _conn is not None:
-        try: _conn.close()
-        except Exception: pass
-        _conn = None
+    _cache.close()

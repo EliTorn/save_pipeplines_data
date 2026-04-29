@@ -114,8 +114,21 @@ def _norm(v):
     return s
 
 
+def _is_zero_like(v):
+    if _is_missing(v) or isinstance(v, bool):
+        return False
+    try:
+        return float(v) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _equal(a, b):
     if _is_missing(a) and _is_missing(b):
+        return True
+    if _is_missing(a) and _is_zero_like(b):
+        return True
+    if _is_missing(b) and _is_zero_like(a):
         return True
     if _is_missing(a) or _is_missing(b):
         return False

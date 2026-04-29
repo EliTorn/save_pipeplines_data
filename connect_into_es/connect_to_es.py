@@ -127,9 +127,11 @@ es_post = lambda p, b: _req("POST", p, b)
 es_get = lambda p: _req("GET", p)
 
 
-def run_tracked(path, body, logger, index=None, batch=None):
+def run_tracked(path, body, logger, index=None, batch=None,
+                env=None, operation="es_search"):
     sql = json.dumps(body, default=str) if body else path
-    with logger.query(sql, owner=None, table=index, batch=batch, params=None) as q:
+    with logger.query(sql, owner=None, table=index, batch=batch, params=None,
+                      env=env, operation=operation) as q:
         resp = es_post(path, body) if body is not None else es_get(path)
         hits = resp.get("hits", {}).get("hits", []) if isinstance(resp, dict) else []
         total = resp.get("hits", {}).get("total", {}) if isinstance(resp, dict) else 0
@@ -162,7 +164,7 @@ def fetch_all(index, logger, query=None, page_size=PAGE_SIZE, max_docs=None, sor
 
 def list_indices(logger, pattern="*"):
     p = f"/_cat/indices/{pattern}?format=json&h=index"
-    with logger.query(p, owner=None, table=None) as q:
+    with logger.query(p, owner=None, table=None, operation="es_list_indices") as q:
         d = es_get(p); q.set_rows(len(d))
     return sorted(x["index"] for x in d if not x["index"].startswith("."))
 

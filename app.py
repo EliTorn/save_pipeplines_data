@@ -6,6 +6,7 @@ import subprocess
 import sys
 from datetime import datetime, date, time
 from pathlib import Path
+from time import monotonic as _now_mono
 
 import pandas as pd
 import streamlit as st
@@ -16,9 +17,93 @@ load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _pipeline_env import DIFF_MODE_ALIASES, TS_FORMATS, normalize_es_env  # noqa: E402
+from core import analytics, duckdb_catalog  # noqa: E402
+from connect_into_postgres import run_summary as _run_summary  # noqa: E402
+from connect_into_postgres import observability as _observability  # noqa: E402
+from apply_changes import pg_tracking as _pg_tracking  # noqa: E402
+
+# Refresh DuckDB catalog so views reflect the current set of out/*.parquet
+# files at app start. Cheap; tolerates no files / no duckdb.
+try:
+    duckdb_catalog.init_catalog()
+except Exception as _e:
+    print(f"[app] duckdb_catalog.init_catalog skipped: {type(_e).__name__}: {_e}")
+
+# Ensure active PG tables exist. Best-effort; silent no-op when PG unreachable.
+for _label, _fn in (
+    ("run_summary",   _run_summary.init_schema),
+    ("observability", _observability.init_schema),
+    ("pg_tracking",   _pg_tracking.init_schema),
+):
+    try:
+        _fn()
+    except Exception as _e:
+        print(f"[app] {_label}.init_schema skipped: {type(_e).__name__}: {_e}")
 
 _PROGRESS_RE = re.compile(r"^\[PROGRESS\]\s+event=(\S+)\s+batch=(\d+)/(\d+)")
 _LOG_TAIL = 30
+
+# Whitelist of stdout patterns to surface in the UI as curated events.
+# Anything not matched is silently discarded (pipe still drained).
+_FILTERS: list[tuple[re.Pattern, object]] = [
+    (re.compile(r"^Run\s+(\S+)\s*\|"),
+     lambda m: f"Connected (run {m.group(1)})"),
+    (re.compile(r"^\[(\w+)\]\s+env=(\w+)\s+id_range\s+min=(\S+)\s+max=(\S+)\s+step=\S+\s+limit=\S+\s+index=(\S+).*?batches=(\d+)\s+workers=(\d+)"),
+     lambda m: f"{m.group(1)} starting on {m.group(2)} (index={m.group(5)}, id_range, {m.group(6)} batches × {m.group(7)} workers)"),
+    (re.compile(r"^\[(\w+)\]\s+env=(\w+).*?index=(\S+).*?batches=(\d+)\s+workers=(\d+)"),
+     lambda m: f"{m.group(1)} starting on {m.group(2)} (index={m.group(3)}, {m.group(4)} batches × {m.group(5)} workers)"),
+    (re.compile(r"^\[(\w+)\]\s+skipped:\s+(.+)$"),
+     lambda m: f"{m.group(1)} skipped ({m.group(2)})"),
+    (re.compile(r"^\[(\w+)\]\s+env=\w+\s+done:\s+changes_files=(\d+)\s+missing_files=(\d+)"),
+     lambda m: f"{m.group(1)} done: {m.group(2)} diff file(s), {m.group(3)} missing file(s)"),
+    (re.compile(r"^\[(\w+)\]\s+env=\w+\s+done:\s+no changes"),
+     lambda m: f"{m.group(1)} done: no changes"),
+    (re.compile(r"^event=(\S+)\s+index=(\S+)\s+pk=\S+\s+env=(\w+)\s+url=\S+\s+dry=(\w+)"),
+     lambda m: f"Apply {m.group(1)} on {m.group(3)} (index={m.group(2)}, dry={m.group(4)})"),
+    (re.compile(r"^\[apply\]\s+reading\s+(\d+)\s+pending\s+diff"),
+     lambda m: f"Found {m.group(1)} changed row(s) to apply"),
+    (re.compile(r"^\[apply\]\s+reading\s+(\d+)\s+pending\s+missing"),
+     lambda m: f"Found {m.group(1)} missing row(s) to insert"),
+    (re.compile(r"^docs to update:\s+(\d+)"),
+     lambda m: f"Updating {m.group(1)} doc(s) in Elasticsearch"),
+    (re.compile(r"^docs to insert:\s+(\d+)"),
+     lambda m: f"Inserting {m.group(1)} doc(s) into Elasticsearch"),
+    (re.compile(r"^\[DRY\]\s+(\d+)\s+docs would be updated"),
+     lambda m: f"Dry run: {m.group(1)} doc(s) would update"),
+    (re.compile(r"^\[DRY\]\s+(\d+)\s+docs would be created"),
+     lambda m: f"Dry run: {m.group(1)} doc(s) would create"),
+    (re.compile(r"^\s*changes batch\s+(\d+)/(\d+):\s+updated=(\d+)\s+conflicts=(\d+)\s+failures=(\d+)"),
+     lambda m: f"apply batch {m.group(1)}/{m.group(2)}: updated={m.group(3)} conflicts={m.group(4)} failures={m.group(5)}"),
+    (re.compile(r"^\s*missing batch\s+(\d+)/(\d+):\s+created=(\d+)\s+skipped\(exists\)=(\d+)\s+errors=(\d+)"),
+     lambda m: f"insert batch {m.group(1)}/{m.group(2)}: created={m.group(3)} exists={m.group(4)} errors={m.group(5)}"),
+    (re.compile(r"^changes done:\s+updated=(\d+)\s+conflicts=(\d+)\s+failures=(\d+)"),
+     lambda m: f"Apply complete: {m.group(1)} updated, {m.group(2)} conflicts, {m.group(3)} failures"),
+    (re.compile(r"^missing done:\s+created=(\d+)\s+skipped\(exists\)=(\d+)\s+errors=(\d+)"),
+     lambda m: f"Insert complete: {m.group(1)} created, {m.group(2)} already existed, {m.group(3)} errors"),
+    (re.compile(r"^\[pg\]\s+(.+)$"),
+     lambda m: f"Postgres: {m.group(1)}"),
+    (re.compile(r"^\[pg-sync\]\s+mirroring"),
+     lambda m: "Syncing to Postgres…"),
+    (re.compile(r"^\[pg-sync\]\s+skipped:\s+(.+)$"),
+     lambda m: f"Postgres sync skipped: {m.group(1)}"),
+    (re.compile(r"^done\.\s*$"),
+     lambda m: "Postgres sync complete"),
+    (re.compile(r"^ABORT\s+—\s+(.+)$"),
+     lambda m: f"ABORT: {m.group(1)}"),
+    (re.compile(r"^WARN:\s+(.+)$"),
+     lambda m: f"warn: {m.group(1)}"),
+]
+
+
+def _filter_line(text: str) -> str | None:
+    for pat, fmt in _FILTERS:
+        m = pat.match(text)
+        if m:
+            try:
+                return fmt(m)
+            except Exception:
+                return None
+    return None
 
 ROOT = Path(__file__).parent
 SETTINGS_DIR = ROOT / "settings"
@@ -63,9 +148,19 @@ def load_env_file() -> dict[str, str]:
     return env
 
 
-def _run_stream(cmd: list[str], placeholder, progress_bar=None) -> tuple[int, str]:
-    """Stream subprocess stdout. If progress_bar given, parse [PROGRESS] markers
-    into st.progress and only show last _LOG_TAIL log lines in placeholder."""
+def _render_events(placeholder, events: list[str]) -> None:
+    if not events:
+        placeholder.markdown("_waiting…_")
+        return
+    placeholder.markdown("\n".join(f"- {e}" for e in events[-_LOG_TAIL:]))
+
+
+def _run_stream(cmd: list[str], placeholder, progress_bar=None) -> tuple[int, list[str]]:
+    """Run cmd, drain stdout always, surface only whitelisted events to UI.
+
+    Pipe is fully drained so the child never blocks on a backed-up stdout.
+    Lines that don't match `_FILTERS` are discarded. UI updates are throttled
+    to ~200ms so Streamlit doesn't repaint per-line."""
     env = {**os.environ, **load_env_file()}
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env,
@@ -73,33 +168,39 @@ def _run_stream(cmd: list[str], placeholder, progress_bar=None) -> tuple[int, st
         text=True, encoding="utf-8", errors="replace",
         bufsize=1,
     )
-    lines: list[str] = []
+    events: list[str] = []
     assert proc.stdout is not None
+    last_render = 0.0
     for raw in proc.stdout:
         text = raw.rstrip("\n")
-        m = _PROGRESS_RE.match(text) if progress_bar is not None else None
-        if m:
-            ev, cur, tot = m.group(1), int(m.group(2)), int(m.group(3))
-            frac = min(cur / tot, 1.0) if tot > 0 else 0.0
-            try:
-                progress_bar.progress(frac, text=f"{ev}: batch {cur}/{tot}")
-            except Exception:
-                pass
-            continue
-        lines.append(text)
         if progress_bar is not None:
-            placeholder.code("\n".join(lines[-_LOG_TAIL:]), language="text")
-        else:
-            placeholder.code("\n".join(lines), language="text")
+            pm = _PROGRESS_RE.match(text)
+            if pm:
+                ev, cur, tot = pm.group(1), int(pm.group(2)), int(pm.group(3))
+                frac = min(cur / tot, 1.0) if tot > 0 else 0.0
+                try:
+                    progress_bar.progress(frac, text=f"{ev}: batch {cur}/{tot}")
+                except Exception:
+                    pass
+                continue
+        msg = _filter_line(text)
+        if msg is None:
+            continue
+        events.append(msg)
+        now = _now_mono()
+        if now - last_render >= 0.2:
+            _render_events(placeholder, events)
+            last_render = now
     proc.wait()
-    return proc.returncode, "\n".join(lines)
+    _render_events(placeholder, events)
+    return proc.returncode, events
 
 
-def run_main_py_stream(placeholder, progress_bar=None) -> tuple[int, str]:
+def run_main_py_stream(placeholder, progress_bar=None) -> tuple[int, list[str]]:
     return _run_stream([sys.executable, "-u", str(MAIN_PY)], placeholder, progress_bar)
 
 
-def run_apply_stream(event: str, mode: str, env_choice: str, dry: bool, placeholder) -> tuple[int, str]:
+def run_apply_stream(event: str, mode: str, env_choice: str, dry: bool, placeholder) -> tuple[int, list[str]]:
     cmd = [sys.executable, "-u", "-m", "apply_changes.apply_changes",
            "--event", event, "--mode", mode, "--env", env_choice]
     if dry:
@@ -111,19 +212,46 @@ def _changes_dir(event: str, env: str) -> Path:
     return OUT_DIR / event / env / "changes"
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def pg_pending_inventory() -> dict[str, dict[str, dict[str, int]]]:
-    """{event: {env: {'changes': N, 'missing': M}}} from Postgres.
-    Reads pipeline_changes / pipeline_missing WHERE applied_ts IS NULL.
-    Returns empty dict if PG unreachable."""
-    try:
-        from connect_into_postgres import connect_to_postgres as pg
-        conn = pg.create_connection()
-    except (Exception, SystemExit):
-        return {}
+    """{event: {env: {'changes': N, 'missing': M}}} of files on disk.
+
+    Phase C+: heavy data lives in local Parquet, so this counts files via
+    DuckDB views (v_changes / v_missing). PG legacy tables are queried only
+    if DuckDB has nothing to show — useful when looking at historical
+    backlog from before Phase C.
+
+    The legacy PG fallback REUSES duckdb_source._cache (the long-lived
+    CachedConnection) instead of opening a fresh conn every 30s — that
+    avoids needless connection churn when PG is healthy.
+
+    Returns empty dict if neither source has data.
+    """
     out: dict[str, dict[str, dict[str, int]]] = {}
+
+    # Primary: DuckDB views over local Parquet.
+    from apply_changes import duckdb_source
     try:
-        with conn.cursor() as cur:
+        for env in ("stage", "prod"):
+            counts = duckdb_source.pending_counts(env) or {}
+            for ev, c in counts.items():
+                out.setdefault(ev, {}).setdefault(env, {"changes": 0, "missing": 0})
+                out[ev][env]["changes"] = int(c.get("changes", 0))
+                out[ev][env]["missing"] = int(c.get("missing", 0))
+    except Exception as e:
+        print(f"[app] duckdb pending_counts failed: {type(e).__name__}: {e}")
+
+    if any(any((d.get("changes", 0) + d.get("missing", 0)) > 0 for d in envs.values())
+           for envs in out.values()):
+        return out
+
+    # Fallback: legacy PG tables. Reuse duckdb_source's cached connection so
+    # we don't churn a fresh connect every cache miss.
+    conn = duckdb_source._cache.get()
+    if conn is None:
+        return out
+    try:
+        with duckdb_source._cache.lock, conn.cursor() as cur:
             cur.execute(
                 "SELECT event, env, COUNT(*) FROM pipeline_changes "
                 "WHERE applied_ts IS NULL "
@@ -140,27 +268,30 @@ def pg_pending_inventory() -> dict[str, dict[str, dict[str, int]]]:
             for ev, en, n in cur.fetchall():
                 out.setdefault(ev, {}).setdefault(en, {"changes": 0, "missing": 0})["missing"] = int(n)
     except Exception as e:
-        print(f"[app] pg_pending_inventory failed: {type(e).__name__}: {e}")
-    finally:
-        try: conn.close()
+        print(f"[app] pg_pending_inventory legacy fallback failed: {type(e).__name__}: {e}")
+        try: conn.rollback()
         except Exception: pass
     return out
 
 
 def envs_with_changes(event: str) -> list[str]:
-    """Which envs (stage/prod) have pending diffs/missing in Postgres for this event."""
+    """Which envs (stage/prod) have pending diffs/missing for this event.
+    Checks DuckDB inventory first, then a local file glob (CSV + Parquet)."""
     inv = pg_pending_inventory().get(event, {})
     out = [en for en in ("stage", "prod")
            if en in inv and (inv[en].get("changes", 0) + inv[en].get("missing", 0)) > 0]
     if out:
         return out
-    # fallback: legacy CSV scan (only used if PG unreachable)
-    legacy = []
+    # Local-disk fallback: any artifact file present (CSV or Parquet).
+    on_disk: list[str] = []
     for env in ("stage", "prod"):
         ch = _changes_dir(event, env)
-        if ch.is_dir() and (any(ch.glob("changes_*.csv")) or any(ch.glob("missing_in_es_*.csv"))):
-            legacy.append(env)
-    return legacy
+        if not ch.is_dir():
+            continue
+        if any(ch.glob("changes_*.csv")) or any(ch.glob("changes_*.parquet")) \
+           or any(ch.glob("missing_in_es_*.csv")) or any(ch.glob("missing_in_es_*.parquet")):
+            on_disk.append(env)
+    return on_disk
 
 
 def list_events_with_changes() -> list[str]:
@@ -322,71 +453,164 @@ def _show_df(df, *, caption: str | None = None, download_name: str | None = None
         )
 
 
-def _pg_health(pg_conn, conn):
-    st.subheader("Pipeline runs")
-    df = _df_or_warn(pg_conn, conn,
-                     "SELECT * FROM v_pipeline_run_metrics LIMIT 100")
-    _show_df(df, caption="latest 100 runs from v_pipeline_run_metrics",
-             download_name="pipeline_run_metrics.csv")
+def _source_badge(source: str) -> str:
+    label = {"duckdb": "duckdb", "pg": "postgres", "failed": "FAILED"}.get(source, source)
+    return f"source: **{label}**"
 
-    st.subheader("Apply progress (per event/env)")
-    df = _df_or_warn(pg_conn, conn, "SELECT * FROM v_pipeline_apply_progress")
-    _show_df(df, caption="from v_pipeline_apply_progress",
-             download_name="apply_progress.csv")
 
-    st.subheader("Recent errors")
+def _show_df_src(df, source: str, *, caption: str | None = None,
+                 download_name: str | None = None):
+    """_show_df + a small source badge so users can tell DuckDB vs PG."""
+    badge = _source_badge(source)
+    full_caption = f"{badge}" + (f" · {caption}" if caption else "")
+    if df is None:
+        st.warning(f"query failed (source attempted: {source})")
+        return
+    _show_df(df, caption=full_caption, download_name=download_name)
+
+
+def _pg_run_summary(pg_conn, conn):
+    """Phase C: PG holds only this thin per-(run, env, target, op) summary."""
     df = _df_or_warn(pg_conn, conn, """
-        SELECT source, run_id, ts, event, "table" AS table_name, error
-        FROM pipeline_log_event
-        WHERE level = 'ERROR'
-        ORDER BY ts DESC
+        SELECT id, run_id, env, target_name, operation,
+               rows_count, source_file,
+               started_at, ended_at,
+               EXTRACT(EPOCH FROM (ended_at - started_at))::numeric(12,3) AS seconds,
+               status, error
+        FROM pipeline_run_summary
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT 200
+    """)
+    _show_df(df, caption=f"{_source_badge('pg')} · pipeline_run_summary "
+                          "— one row per (run, env, target, operation)",
+             download_name="pipeline_run_summary.csv")
+
+
+def _pg_observability(pg_conn, conn):
+    """Phase D observability: connection_log / query_log / batch_log."""
+    badge = _source_badge("pg")
+
+    st.subheader("Connection log (recent 100)")
+    df = _df_or_warn(pg_conn, conn, """
+        SELECT id, run_id, env, system_name, target_name, host,
+               started_at, ended_at, duration_ms, status, error
+        FROM connection_log
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT 100
+    """)
+    _show_df(df, caption=f"{badge} · connection_log",
+             download_name="connection_log.csv")
+
+    st.subheader("Slowest queries (top 50)")
+    df = _df_or_warn(pg_conn, conn, """
+        SELECT id, run_id, env, batch_id, system_name, target_name,
+               operation, query_hash, duration_ms,
+               rows_returned, rows_affected, status, error,
+               started_at
+        FROM query_log
+        WHERE duration_ms IS NOT NULL
+        ORDER BY duration_ms DESC NULLS LAST
         LIMIT 50
     """)
-    _show_df(df, caption="latest 50 ERROR events", download_name="recent_errors.csv")
+    _show_df(df, caption=f"{badge} · query_log (slow first)",
+             download_name="query_log_slowest.csv")
+
+    st.subheader("Recent failed queries")
+    df = _df_or_warn(pg_conn, conn, """
+        SELECT id, run_id, env, system_name, target_name, operation,
+               query_hash, duration_ms, error, started_at
+        FROM query_log
+        WHERE status = 'failed' OR error IS NOT NULL
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT 100
+    """)
+    _show_df(df, caption=f"{badge} · query_log (failures)",
+             download_name="query_log_failed.csv")
+
+    st.subheader("Batch throughput per target/operation")
+    df = _df_or_warn(pg_conn, conn, """
+        SELECT target_name, operation,
+               COUNT(*)                                AS batches,
+               SUM(rows_returned)                      AS rows_total,
+               AVG(duration_ms)::numeric(12,1)         AS avg_ms,
+               MAX(duration_ms)                        AS max_ms,
+               COUNT(*) FILTER (WHERE status='failed') AS failures,
+               MAX(started_at)                         AS last_seen
+        FROM batch_log
+        GROUP BY target_name, operation
+        ORDER BY batches DESC
+    """)
+    _show_df(df, caption=f"{badge} · batch_log aggregate",
+             download_name="batch_log_aggregate.csv")
+
+    st.subheader("Recent batches (last 100)")
+    df = _df_or_warn(pg_conn, conn, """
+        SELECT id, run_id, env, batch_id, target_name, operation,
+               source_system, rows_returned, rows_changed, rows_missing,
+               duration_ms, status, error, started_at
+        FROM batch_log
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT 100
+    """)
+    _show_df(df, caption=f"{badge} · batch_log",
+             download_name="batch_log_recent.csv")
+
+
+def _pg_health(pg_conn, conn):
+    st.subheader("Run summary (per run / env / target / operation)")
+    _pg_run_summary(pg_conn, conn)
+
+    with st.expander("Observability — connection / query / batch logs", expanded=False):
+        _pg_observability(pg_conn, conn)
+
+    st.subheader("Pipeline runs (from logs)")
+    df, src = analytics.run_metrics(pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(df, src, caption="latest 100 runs (derived from log CSVs via DuckDB)",
+                 download_name="pipeline_run_metrics.csv")
+
+    st.subheader("Recent errors")
+    df, src = analytics.recent_errors(pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(df, src, caption="latest 50 ERROR events",
+                 download_name="recent_errors.csv")
 
 
 def _pg_connection_logs(pg_conn, conn):
     st.subheader("Connection overview")
-    df = _df_or_warn(pg_conn, conn, "SELECT * FROM v_pipeline_connection_overview")
-    _show_df(df, caption="success/fail counts per source",
-             download_name="connection_overview.csv")
+    df, src = analytics.connection_overview(pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(df, src, caption="success/fail counts per source",
+                 download_name="connection_overview.csv")
 
     c1, c2 = st.columns([1, 1])
     with c1:
         source = st.selectbox("Source filter",
-                              ["(all)", "oracle", "es", "postgres"], index=0)
+                              ["(all)", "oracle", "orcal", "es", "postgres"], index=0)
     with c2:
         status = st.selectbox("Status", ["(all)", "success", "failed"], index=0)
-    where = []
-    params: list = []
-    if source != "(all)":
-        where.append("source = %s"); params.append(source)
-    if status != "(all)":
-        where.append("status = %s"); params.append(status)
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     st.subheader("Recent connections")
-    df = _df_or_warn(pg_conn, conn,
-                     f"SELECT * FROM v_pipeline_connections {where_sql} "
-                     f"ORDER BY start_ts DESC NULLS LAST LIMIT 200",
-                     tuple(params) if params else None)
-    _show_df(df, caption="from v_pipeline_connections",
-             download_name="connections.csv")
+    df, src = analytics.connections_recent(
+        source=None if source == "(all)" else source,
+        status=None if status == "(all)" else status,
+        pg_module=pg_conn, pg_conn=conn,
+    )
+    _show_df_src(df, src, caption="recent connections",
+                 download_name="connections.csv")
 
 
 def _pg_query_perf(pg_conn, conn):
     st.subheader("Slowest 50 queries (any source)")
-    df = _df_or_warn(pg_conn, conn, "SELECT * FROM v_pipeline_query_slowest")
-    _show_df(df, download_name="slowest_queries.csv")
+    df, src = analytics.query_slowest(pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(df, src, download_name="slowest_queries.csv")
 
     st.subheader("Best/worst hour for a specific query (sql_hash)")
     st.caption("Pick one query — same sql_hash means same SQL — to see how its "
                "latency varies hour-by-hour. Different queries are NOT averaged together.")
 
-    hashes_df = _df_or_warn(pg_conn, conn, "SELECT * FROM v_pipeline_query_hashes LIMIT 200")
+    hashes_df, hashes_src = analytics.query_hashes(pg_module=pg_conn, pg_conn=conn)
     if hashes_df is None or hashes_df.empty:
         st.info("no query history yet — run the pipeline first")
         return
+    st.caption(_source_badge(hashes_src) + " · query hashes index")
 
     def _label(row) -> str:
         return (f"{row['sql_hash']}  ·  {row['source']}  ·  "
@@ -403,15 +627,11 @@ def _pg_query_perf(pg_conn, conn):
     st.caption(f"**SQL preview:** `{meta.get('sql_preview') or '(empty)'}`  ·  "
                f"first_seen={meta['first_seen']}  ·  last_seen={meta['last_seen']}")
 
-    by_hr = _df_or_warn(pg_conn, conn,
-                        "SELECT hour_of_day, runs, avg_seconds, min_seconds, "
-                        "max_seconds, total_rows, avg_rows_per_sec "
-                        "FROM v_pipeline_query_by_hour "
-                        "WHERE sql_hash = %s AND source = %s "
-                        "ORDER BY hour_of_day",
-                        (picked_hash, picked_source))
-    _show_df(by_hr, caption=f"hour-by-hour timing for sql_hash={picked_hash}",
-             download_name=f"query_by_hour_{picked_hash}.csv")
+    by_hr, hr_src = analytics.query_by_hour(picked_hash, source=picked_source,
+                                            pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(by_hr, hr_src,
+                 caption=f"hour-by-hour timing for sql_hash={picked_hash}",
+                 download_name=f"query_by_hour_{picked_hash}.csv")
 
     if by_hr is not None and not by_hr.empty:
         try:
@@ -434,35 +654,26 @@ def _pg_query_perf(pg_conn, conn):
 
     st.subheader("All queries (slow flagged)")
     only_slow = st.checkbox("only slow_query=true", value=False)
-    src = st.selectbox("source", ["(all)", "oracle", "es", "postgres"], index=0,
-                       key="qperf_src")
-    where = []
-    params: list = []
-    if only_slow:
-        where.append("slow_query = TRUE")
-    if src != "(all)":
-        where.append("source = %s"); params.append(src)
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    df = _df_or_warn(pg_conn, conn,
-                     f"SELECT id, source, run_id, query_table, batch, "
-                     f"start_ts, seconds, rows, rows_per_sec, status, slow_query, sql_hash "
-                     f"FROM v_pipeline_query_perf {where_sql} "
-                     f"ORDER BY start_ts DESC NULLS LAST LIMIT 500",
-                     tuple(params) if params else None)
-    _show_df(df, download_name="queries.csv")
+    src_pick = st.selectbox("source", ["(all)", "oracle", "orcal", "es", "postgres"],
+                            index=0, key="qperf_src")
+    df, src = analytics.query_perf(
+        only_slow=only_slow,
+        source=None if src_pick == "(all)" else src_pick,
+        pg_module=pg_conn, pg_conn=conn,
+    )
+    _show_df_src(df, src, download_name="queries.csv")
 
 
 def _pg_diffs(pg_conn, conn):
     st.subheader("Data quality (per event/env/field)")
-    df = _df_or_warn(pg_conn, conn, "SELECT * FROM v_pipeline_data_quality LIMIT 200")
-    _show_df(df, caption="from v_pipeline_data_quality",
-             download_name="data_quality.csv")
+    df, src = analytics.data_quality(pg_module=pg_conn, pg_conn=conn)
+    _show_df_src(df, src, caption="aggregate diff/missing counts per field",
+                 download_name="data_quality.csv")
 
     st.subheader("Field-level diffs")
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        ev_df = _df_or_warn(pg_conn, conn,
-                            "SELECT DISTINCT event FROM pipeline_changes ORDER BY event")
+        ev_df, _ = analytics.changes_distinct_events(pg_module=pg_conn, pg_conn=conn)
         events_list = ev_df["event"].tolist() if (ev_df is not None and not ev_df.empty) else []
         ev = st.selectbox("event", ["(all)"] + events_list, key="diff_ev")
     with c2:
@@ -470,16 +681,13 @@ def _pg_diffs(pg_conn, conn):
     with c3:
         st_ = st.selectbox("status", ["(all)", "diff", "applied",
                                        "missing_in_es", "missing_in_oracle"], key="diff_st")
-    where = []; params: list = []
-    if ev != "(all)": where.append("event = %s"); params.append(ev)
-    if en != "(all)": where.append("env = %s"); params.append(en)
-    if st_ != "(all)": where.append("status = %s"); params.append(st_)
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    df = _df_or_warn(pg_conn, conn,
-                     f"SELECT * FROM pipeline_changes {where_sql} "
-                     f"ORDER BY id DESC LIMIT 1000",
-                     tuple(params) if params else None)
-    _show_df(df, download_name="diffs.csv")
+    df, src = analytics.changes_browse(
+        event=None if ev == "(all)" else ev,
+        env=None if en == "(all)" else en,
+        status=None if st_ == "(all)" else st_,
+        pg_module=pg_conn, pg_conn=conn,
+    )
+    _show_df_src(df, src, download_name="diffs.csv")
 
 
 def _pg_missing(pg_conn, conn):
@@ -501,16 +709,12 @@ def _pg_missing(pg_conn, conn):
         ev = st.text_input("event filter (exact)", "", key="mis_ev")
     with c2:
         en = st.selectbox("env", ["(all)", "stage", "prod"], key="mis_env")
-    where = []; params: list = []
-    if ev.strip(): where.append("event = %s"); params.append(ev.strip())
-    if en != "(all)": where.append("env = %s"); params.append(en)
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    df = _df_or_warn(pg_conn, conn,
-                     f"SELECT id, sync_ts, event, env, doc_id, applied_ts, payload "
-                     f"FROM pipeline_missing {where_sql} "
-                     f"ORDER BY id DESC LIMIT 500",
-                     tuple(params) if params else None)
-    _show_df(df, download_name="missing_rows.csv")
+    df, src = analytics.missing_browse(
+        event=ev.strip() or None,
+        env=None if en == "(all)" else en,
+        pg_module=pg_conn, pg_conn=conn,
+    )
+    _show_df_src(df, src, download_name="missing_rows.csv")
 
 
 def _pg_apply_audit(pg_conn, conn):
@@ -543,18 +747,58 @@ def _pg_raw_tables(pg_conn, conn):
         st.info("No tables yet — run the pipeline first.")
         return
 
-    tables = tables_df["table_name"].tolist()
-    OUTPUT_ORDER = ["pipeline_changes", "pipeline_missing",
-                    "pipeline_apply_audit", "pipeline_apply_batches",
-                    "pipeline_summary"]
-    LOG_ORDER = ["pipeline_log_connection", "pipeline_log_event",
-                 "pipeline_log_query", "pipeline_log_offsets"]
+    all_tables = tables_df["table_name"].tolist()
+
+    # Active tables (Phase D / loop 6) — what the pipeline actually uses today.
+    ACTIVE_TABLES = [
+        "pipeline_run_summary",     # one row per (run, env, target, operation)
+        "connection_log",           # observability: per-connection timing
+        "query_log",                # observability: per-query timing + counts
+        "batch_log",                # observability: per-batch timing + counts
+        "pipeline_apply_batches",   # apply state: which CSVs already in ES
+    ]
+    LEGACY_TABLES = {
+        "pipeline_changes", "pipeline_missing", "pipeline_apply_audit",
+        "pipeline_summary",
+        "pipeline_log_connection", "pipeline_log_event",
+        "pipeline_log_query", "pipeline_log_offsets",
+        "file_registry", "ingest_log",
+    }
+
+    show_legacy = st.checkbox(
+        "Show legacy tables too",
+        value=False,
+        help="Active set: pipeline_run_summary + connection_log + query_log + "
+             "batch_log + pipeline_apply_batches. Everything else is legacy "
+             "(read-only after Phase C; will be removed by drop_legacy_tables.py).",
+    )
+
+    if show_legacy:
+        tables = all_tables[:]
+    else:
+        tables = [t for t in ACTIVE_TABLES if t in all_tables]
+        hidden = [t for t in all_tables
+                  if t not in ACTIVE_TABLES and t in LEGACY_TABLES]
+        other  = [t for t in all_tables
+                  if t not in ACTIVE_TABLES and t not in LEGACY_TABLES]
+        if hidden:
+            st.caption(f"Hiding {len(hidden)} legacy table(s): "
+                       + ", ".join(f"`{t}`" for t in sorted(hidden)))
+        if other:
+            st.caption(f"Hiding {len(other)} other table(s) "
+                       "(not part of the active or legacy set): "
+                       + ", ".join(f"`{t}`" for t in sorted(other)))
+
+    if not tables:
+        st.info("No matching tables. Toggle 'Show legacy tables too' to see "
+                "the full list, or run the pipeline first.")
+        return
 
     def _sort_key(name: str) -> tuple:
-        if name in OUTPUT_ORDER:
-            return (0, OUTPUT_ORDER.index(name))
-        if name in LOG_ORDER:
-            return (1, LOG_ORDER.index(name))
+        if name in ACTIVE_TABLES:
+            return (0, ACTIVE_TABLES.index(name))
+        if name in LEGACY_TABLES:
+            return (1, name)
         return (2, name)
     tables.sort(key=_sort_key)
 
@@ -905,17 +1149,16 @@ def render_apply_page():
     log_box = st.empty()
     last = st.session_state.get("apply_page_last")
     if run_clicked:
-        log_box.code(f"starting apply_changes index={index} event={event} env={env_choice} "
-                     f"mode={mode} dry={dry} no_refresh={no_refresh}...", language="text")
+        log_box.markdown(f"_starting apply_changes for `{event}` on `{env_choice}` (mode={mode}, dry={dry})…_")
         cmd = [sys.executable, "-u", "-m", "apply_changes.apply_changes",
                "--event", event, "--mode", mode, "--env", env_choice]
         if dry:
             cmd.append("--dry")
         if no_refresh:
             cmd.append("--no-refresh")
-        rc, full = _run_stream(cmd, log_box)
+        rc, events = _run_stream(cmd, log_box)
         st.session_state["apply_page_last"] = {
-            "rc": rc, "out": full,
+            "rc": rc, "events": events,
             "index": index, "event": event, "env": env_choice,
             "mode": mode, "dry": dry,
         }
@@ -925,14 +1168,11 @@ def render_apply_page():
         tag = (f"index={last['index']} event={last['event']} env={last['env']} "
                f"mode={last['mode']} dry={last['dry']}")
         if last["rc"] == 0:
-            st.success(f"apply_changes exit=0 ({tag})")
+            st.success(f"Done ({tag})")
         else:
-            st.error(f"apply_changes exit={last['rc']} ({tag})")
+            st.error(f"Failed exit={last['rc']} ({tag})")
         if not run_clicked:
-            tail = "\n".join((last["out"] or "").splitlines()[-_LOG_TAIL:]) or "(empty)"
-            log_box.code(tail, language="text")
-        with st.expander("Full log"):
-            st.code(last["out"] or "(empty)", language="text")
+            _render_events(log_box, last.get("events") or [])
 
 
 def render_postgres_page():
@@ -1257,11 +1497,11 @@ st.markdown(f"**Live output** (last {_LOG_TAIL} lines)")
 log_box = st.empty()
 
 if run_clicked:
-    log_box.code("starting main.py...", language="text")
+    log_box.markdown("_starting main.py…_")
     progress_box.progress(0.0, text="starting...")
-    rc, full = run_main_py_stream(log_box, progress_box)
+    rc, events = run_main_py_stream(log_box, progress_box)
     progress_box.progress(1.0, text=f"done (exit={rc})")
-    st.session_state["last_run"] = {"rc": rc, "out": full}
+    st.session_state["last_run"] = {"rc": rc, "events": events}
     try:
         sp, sdf, _ = build_changes_summary()
         st.session_state["last_summary"] = {"path": str(sp) if sp else None,
@@ -1273,14 +1513,11 @@ if run_clicked:
 last = st.session_state.get("last_run")
 if last:
     if last["rc"] == 0:
-        st.success("main.py exit=0")
+        st.success("Done")
     else:
-        st.error(f"main.py exit={last['rc']}")
+        st.error(f"Failed (exit={last['rc']})")
     if not run_clicked:
-        tail = "\n".join((last["out"] or "").splitlines()[-_LOG_TAIL:]) or "(empty)"
-        log_box.code(tail, language="text")
-    with st.expander("Full log"):
-        st.code(last["out"] or "(empty)", language="text")
+        _render_events(log_box, last.get("events") or [])
 
 st.markdown("---")
 st.subheader("Changes summary")
@@ -1346,7 +1583,7 @@ apply_events = list_events_with_changes()
 if not apply_events:
     st.info("No event has pending diffs/missing in Postgres "
             "(`pipeline_changes` / `pipeline_missing` with `applied_ts IS NULL`). "
-            "Run `main.py` first to generate diffs, or check that sync_out completed.")
+            "Run `main.py` first to generate diffs.")
 else:
     ac1, ac2, ac3 = st.columns([2, 2, 1])
     with ac1:
@@ -1415,10 +1652,9 @@ else:
         _mode = "both"
 
     if _mode is not None:
-        apply_log.code(f"starting apply_changes mode={_mode} event={apply_event} env={apply_env} dry={apply_dry}...",
-                       language="text")
-        rc, full = run_apply_stream(apply_event, _mode, apply_env, apply_dry, apply_log)
-        st.session_state["last_apply"] = {"rc": rc, "out": full,
+        apply_log.markdown(f"_starting apply_changes mode={_mode} event={apply_event} env={apply_env} dry={apply_dry}…_")
+        rc, events = run_apply_stream(apply_event, _mode, apply_env, apply_dry, apply_log)
+        st.session_state["last_apply"] = {"rc": rc, "events": events,
                                           "event": apply_event, "env": apply_env,
                                           "mode": _mode, "dry": apply_dry}
 
@@ -1426,10 +1662,10 @@ else:
     if last_apply and _mode is None:
         tag = f"event={last_apply['event']} env={last_apply['env']} mode={last_apply['mode']} dry={last_apply['dry']}"
         if last_apply["rc"] == 0:
-            st.success(f"apply_changes exit=0 ({tag})")
+            st.success(f"Done ({tag})")
         else:
-            st.error(f"apply_changes exit={last_apply['rc']} ({tag})")
-        apply_log.code(last_apply["out"] or "(empty)", language="text")
+            st.error(f"Failed exit={last_apply['rc']} ({tag})")
+        _render_events(apply_log, last_apply.get("events") or [])
 
 st.markdown("---")
 _event_out_dir = OUT_DIR / sel / es_env / "changes"

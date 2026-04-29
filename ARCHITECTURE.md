@@ -33,19 +33,31 @@
 │       │   └── schema.csv
 │       └── playerinfoidx/
 ├── apply_changes/                # write the diffs back to ES
-│   ├── apply_changes.py          #   CLI: --event --env --mode --dry; uses adapter
+│   ├── apply_changes.py          #   CLI: --event --env --mode --dry; default --source duckdb
 │   ├── es_schema.py              #   fetch + flatten + validate ES mapping
 │   ├── fetch_schemas.py          #   one-shot per-index schema CSV refresh
-│   ├── pg_source.py              #   read pending diffs from Postgres
-│   └── pg_tracking.py            #   mark applied files in Postgres
+│   ├── duckdb_source.py          #   read pending diffs from local Parquet via DuckDB
+│   ├── pg_source.py              #   legacy fallback: read pending diffs from Postgres
+│   └── pg_tracking.py            #   mark applied files in Postgres (small state)
 ├── connect_into_orcal/           # Oracle connection + run_tracked() instrumentation
 ├── connect_into_es/              # ES query helpers (fetch_range_df, fetch_terms_df)
-├── connect_into_postgres/        # PG connection + sync_out (mirror out/ → PG)
+├── connect_into_postgres/        # observability + summary writers
+│   ├── _pg_cache.py              #   shared CachedConnection helper (sticky failure)
+│   ├── connect_to_postgres.py    #   create_connection, run_query, execute
+│   ├── observability.py          #   connection_log / query_log / batch_log inserts
+│   ├── run_summary.py            #   pipeline_run_summary inserts
+│   ├── write_through.py          #   legacy DDL only (CREATE IF NOT EXISTS)
+│   ├── parity_check.py           #   compare PG vs DuckDB row counts
+│   └── sync_out.py               #   LEGACY one-shot manual mirror (not in main flow)
+├── duckdb_data/                  # local DuckDB catalog over Parquet/CSV
+│   └── pipeline.duckdb           #   views only — safe to delete + reinit
 └── out/                          # all pipeline output (per event / per env)
     └── <EVENT>/<env>/
         ├── changes/
-        │   ├── changes_<stamp>.csv
-        │   └── missing_in_es_<stamp>.csv
+        │   ├── changes_<stamp>.csv         # human-readable copy
+        │   ├── changes_<stamp>.parquet     # DuckDB read target
+        │   ├── missing_in_es_<stamp>.csv
+        │   └── missing_in_es_<stamp>.parquet
         └── <EVENT>_oracle_<stamp>.csv     # only when PIPELINE_SAVE_FULL_CSV=1
 ```
 
@@ -71,21 +83,29 @@
             └──────────────► compare_records ◄──────────┘
                                   │
                                   ▼
-                  out/<EVENT>/<env>/changes/*.csv
+                out/<EVENT>/<env>/changes/*.{csv,parquet}
+                  (local files = source of truth)
                                   │
                                   ▼
-                  connect_into_postgres.sync_out
-                  (mirror to pipeline_changes / pipeline_missing)
+                       DuckDB views (v_changes / v_missing)
                                   │
                                   ▼
                        apply_changes.apply_changes
-                                  │
+                                  │       (default --source duckdb)
                                   ▼
                   adapter.coerce_for_es(field, value)
                   adapter.before_apply(doc)
                                   │
                                   ▼
                           Elasticsearch
+
+  Side channel (small, async, best-effort, never blocks pipeline):
+
+       Oracle / ES / PG queries  ─┐
+       per-batch results         ─┼─►  connection_log  (PG)
+       per-event totals          ─┤    query_log       (PG)
+                                  └──► batch_log       (PG)
+                                       pipeline_run_summary (PG)
 ```
 
 ## Mode dispatch
@@ -136,16 +156,39 @@ Per-batch work runs in a `multiprocessing.spawn` pool sized by
   (e.g. enum lookups) locally — no cross-process lambda pickling.
 - Logging events flow back via a queue to the parent's listener thread.
 
-## Postgres as source of truth
+## PostgreSQL role (Phase D+)
 
-`connect_into_postgres.sync_out` mirrors every `out/` artifact to PG:
+PG holds **only** small operational metadata. Heavy data lives on disk and
+is queried through DuckDB. Every PG insert is best-effort — pipeline never
+blocks on PG availability.
 
-- `pipeline_changes` — one row per field-level diff.
-- `pipeline_missing` — one row per Oracle row missing from ES.
-- `pipeline_apply_audit` — append-only log of every ES op.
-- `pipeline_run` / `pipeline_event` / `pipeline_query` — instrumentation
-  produced by the logger.
+### Active tables
 
-`apply_changes` reads `WHERE applied_ts IS NULL` from PG by default
-(`--source pg|csv|auto`). CSV files in `out/` are the local cache; PG
-rows are the durable plan.
+| Table | Purpose |
+|---|---|
+| `pipeline_run_summary` | one row per (run_id, env, target_name, operation) |
+| `connection_log` | per-connection timing/status (oracle / elasticsearch / postgres) |
+| `query_log` | per Oracle/ES query timing + row counts (no result payloads) |
+| `batch_log` | per pipeline batch (compare / apply_changes / apply_missing) |
+| `pipeline_apply_batches` | per-CSV applied-marker, used by duckdb_source for filtering |
+
+### Legacy tables (read-only after Phase C)
+
+`pipeline_changes`, `pipeline_missing`, `pipeline_apply_audit`,
+`pipeline_summary`, `pipeline_log_*`. Idempotent CREATE IF NOT EXISTS at
+startup, but no new writes. `sync_out.py` is a manual one-shot tool to
+backfill these from local files if needed; not invoked by the active flow.
+
+### Apply path source priority
+
+`apply_changes --source duckdb` (default) → reads Parquet via DuckDB,
+filters out files in `pipeline_apply_batches`, pushes to ES.
+`--source pg` → legacy `pipeline_changes` reads (only useful with old data).
+`--source csv` → direct disk read of `changes_*.csv` files.
+`--source auto` → tries `pg → duckdb → csv` in order.
+
+### Failure mode
+
+Every PG-touching module routes through `connect_into_postgres._pg_cache.
+CachedConnection`: first failure prints one warning, subsequent calls
+return None silently. Pipeline finishes the same speed PG-up or PG-down.

@@ -44,6 +44,7 @@ class RunLogger(RunLoggerBase):
     CONN_FIELDS = CONN_FIELDS
     PREFIX = "pg "
     CONN_PRINT_VERBOSE_ONLY = True
+    SYSTEM_NAME = "postgres"
 
 
 def get_run_logger(run_id: str | None = None) -> RunLogger:

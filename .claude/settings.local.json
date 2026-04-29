@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "mcp__oracle-bi__execute_query",
-      "mcp__oracle-bi__filter_table_names"
+      "mcp__oracle-bi__filter_table_names",
+      "mcp__oracle__describe_table",
+      "mcp__oracle__query",
+      "mcp__es_prod__get_doc",
+      "Bash(py -c ' *)"
     ]
   }
 }

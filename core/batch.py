@@ -216,7 +216,8 @@ def _load_lookup(conn, sql_file_rel: str, logger) -> dict[str, str]:
     if abs_path in _LOOKUP_CACHE:
         return _LOOKUP_CACHE[abs_path]
     sql = (_SETTINGS_DIR / sql_file_rel).read_text(encoding="utf-8")
-    df, _ = run_tracked(conn, sql, {}, logger, table=f"lookup::{sql_file_rel}", batch=0)
+    df, _ = run_tracked(conn, sql, {}, logger, table=f"lookup::{sql_file_rel}",
+                        batch=0, operation="oracle_lookup")
     if df.empty or len(df.columns) < 2:
         _LOOKUP_CACHE[abs_path] = {}
         return _LOOKUP_CACHE[abs_path]
@@ -280,58 +281,71 @@ def _apply_lookup(shaped: pd.DataFrame, df_raw: pd.DataFrame, part: dict, conn, 
 # ---------------------------------------------------------------------------
 
 def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
-               sql, pk, index, event_dir_str, w_from, w_to, batch_idx, adapter=None):
+               sql, pk, index, event_dir_str, w_from, w_to, batch_idx,
+               env: str = "", adapter=None):
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
     stamp = w_from.strftime("%Y%m%d_%H%M%S")
 
-    df_ora, qid = run_tracked(conn, sql, params, logger, table=event, batch=batch_idx)
+    df_ora, qid = run_tracked(conn, sql, params, logger, table=event,
+                              batch=batch_idx, env=env, operation="oracle_select")
     df_ora = plan.filter_oracle(df_ora)
     shaped_ora = transform_to_es_shape(df_ora, plan.mapping, adapter=adapter)
     save_oracle_csv(shaped_ora, ev_dir / f"{event}_oracle_{stamp}.csv",
                     event, batch_idx, logger, query_id=qid)
 
-    with logger.query(f"ES {index} {w_from}->{w_to}", table=index, batch=batch_idx) as q:
+    with logger.query(f"ES {index} {w_from}->{w_to}", table=index,
+                      batch=batch_idx, env=env, operation="es_search") as q:
         df_es = fetch_range_df(index, entry_es, w_from, w_to)
         q.set_rows(len(df_es))
     df_es = plan.filter_es(df_es)
     save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
 
-    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
-               ev_dir, stamp, event, batch_idx, logger,
-               shaped_ora=shaped_ora, pk=pk)
-    return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es)}
+    diff_counts = save_diffs(
+        compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
+        ev_dir, stamp, event, batch_idx, logger,
+        shaped_ora=shaped_ora, pk=pk,
+    )
+    return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es),
+            "diff_counts": diff_counts}
 
 
 def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
-                   batch_sql, pk, index, event_dir_str, from_id, to_id, batch_idx, adapter=None):
+                   batch_sql, pk, index, event_dir_str, from_id, to_id, batch_idx,
+                   env: str = "", adapter=None):
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_id": from_id, "to_id": to_id}
     stamp = f"{from_id}_{to_id}"
 
-    df_ora, qid = run_tracked(conn, batch_sql, params, logger, table=event, batch=batch_idx)
+    df_ora, qid = run_tracked(conn, batch_sql, params, logger, table=event,
+                              batch=batch_idx, env=env, operation="oracle_select")
     df_ora = plan.filter_oracle(df_ora)
     shaped_ora = transform_to_es_shape(df_ora, plan.mapping, adapter=adapter)
     save_oracle_csv(shaped_ora, ev_dir / f"{event}_oracle_{stamp}.csv",
                     event, batch_idx, logger, query_id=qid)
 
     ids = df_ora[pk].tolist() if pk in df_ora.columns else []
-    with logger.query(f"ES {index} terms {pk} n={len(ids)}", table=index, batch=batch_idx) as q:
+    with logger.query(f"ES {index} terms {pk} n={len(ids)}", table=index,
+                      batch=batch_idx, env=env, operation="es_search") as q:
         df_es = fetch_terms_df(index, pk, ids, entry)
         q.set_rows(len(df_es))
     df_es = plan.filter_es(df_es)
     save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
 
-    save_diffs(compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
-               ev_dir, stamp, event, batch_idx, logger,
-               shaped_ora=shaped_ora, pk=pk)
-    return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es)}
+    diff_counts = save_diffs(
+        compare_records(df_ora, df_es, plan.mapping, pk, adapter=adapter),
+        ev_dir, stamp, event, batch_idx, logger,
+        shaped_ora=shaped_ora, pk=pk,
+    )
+    return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es),
+            "diff_counts": diff_counts}
 
 
 def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
-                     allowed, pk, index, event_dir_str, w_from, w_to, batch_idx, adapter=None):
+                     allowed, pk, index, event_dir_str, w_from, w_to, batch_idx,
+                     env: str = "", adapter=None):
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
     stamp = w_from.strftime("%Y%m%d_%H%M%S")
@@ -341,7 +355,8 @@ def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
     total_raw = 0
     for j, prep in enumerate(parts_prepared, 1):
         df_raw, _ = run_tracked(conn, prep["sql"], params, logger,
-                                table=f"{event}::part{j}", batch=batch_idx)
+                                table=f"{event}::part{j}", batch=batch_idx,
+                                env=env, operation="oracle_select")
         total_raw += len(df_raw)
         shaped = transform_to_es_shape(df_raw, prep["mapping"], adapter=adapter)
         shaped = _apply_lookup(shaped, df_raw, prep["raw_part"], conn, logger)
@@ -353,7 +368,8 @@ def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
     save_oracle_csv(df_ora_shaped, ev_dir / f"{event}_oracle_{stamp}.csv",
                     event, batch_idx, logger, parts=len(parts_prepared), raw_rows=total_raw)
 
-    with logger.query(f"ES {index} {w_from}->{w_to}", table=index, batch=batch_idx) as q:
+    with logger.query(f"ES {index} {w_from}->{w_to}", table=index,
+                      batch=batch_idx, env=env, operation="es_search") as q:
         df_es = fetch_range_df(index, entry_es, w_from, w_to)
         q.set_rows(len(df_es))
     if keep_set is not None and not df_es.empty:
@@ -361,7 +377,10 @@ def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
     save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
 
     fields = list(allowed) if allowed else None
-    save_diffs(compare_shaped(df_ora_shaped, df_es, pk, fields=fields),
-               ev_dir, stamp, event, batch_idx, logger,
-               shaped_ora=df_ora_shaped, pk=pk)
-    return {"batch": batch_idx, "ora_rows": len(df_ora_shaped), "es_rows": len(df_es)}
+    diff_counts = save_diffs(
+        compare_shaped(df_ora_shaped, df_es, pk, fields=fields),
+        ev_dir, stamp, event, batch_idx, logger,
+        shaped_ora=df_ora_shaped, pk=pk,
+    )
+    return {"batch": batch_idx, "ora_rows": len(df_ora_shaped), "es_rows": len(df_es),
+            "diff_counts": diff_counts}

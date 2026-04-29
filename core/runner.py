@@ -4,11 +4,12 @@ from __future__ import annotations
 import multiprocessing as mp
 import sys
 import time
-from pathlib import Path
+from datetime import datetime, timezone
 
 from connect_into_orcal.connect_to_orcal import create_connection
 from connect_into_orcal.logging_setup import QueueLogger, start_log_listener
 from connect_into_es.connect_to_es import es_time_field
+from connect_into_postgres import run_summary, observability
 from core.adapter_loader import get_adapter
 from core.batch import (
     DEFAULT_BATCH_SIZE, Plan, add_time_filter, batch_id_range, batch_time, batch_time_union,
@@ -74,9 +75,15 @@ def _worker_batch(task: dict):
     raise ValueError(f"unknown batch kind: {kind}")
 
 
-def _execute_tasks(pool, tasks: list, event: str, total: int) -> None:
+def _execute_tasks(pool, tasks: list, event: str, total: int,
+                   *, run_id: str = "", env: str = "",
+                   index: str = "") -> dict:
+    """Run all tasks; return aggregated counts {'changes': N, 'missing': M,
+    'ora_rows': N, 'es_rows': N}. Per batch, also write a batch_log row
+    (operation='compare') for observability."""
+    agg = {"changes": 0, "missing": 0, "ora_rows": 0, "es_rows": 0}
     if not tasks:
-        return
+        return agg
     bar = None
     if tqdm is not None:
         bar = tqdm(total=total, desc=event, unit="batch", disable=not sys.stderr.isatty())
@@ -87,23 +94,80 @@ def _execute_tasks(pool, tasks: list, event: str, total: int) -> None:
             if bar is not None:
                 bar.update(1)
             _emit_progress(event, done, total)
-            if VERBOSE and isinstance(result, dict):
-                msg = (f"[{event}] batch {result.get('batch')}/{total} "
-                       f"oracle={result.get('ora_rows')}r es={result.get('es_rows')}r")
-                if bar is not None:
-                    bar.write(msg)
-                else:
-                    print(msg)
+            if isinstance(result, dict):
+                ora_rows = int(result.get("ora_rows") or 0)
+                es_rows = int(result.get("es_rows") or 0)
+                dc = result.get("diff_counts") or {}
+                changes = int(dc.get("changes") or 0)
+                missing = int(dc.get("missing") or 0)
+                agg["ora_rows"] += ora_rows
+                agg["es_rows"] += es_rows
+                agg["changes"] += changes
+                agg["missing"] += missing
+                # batch_log: one row per finished batch.
+                if run_id:
+                    now = datetime.now(timezone.utc)
+                    try:
+                        observability.log_batch(
+                            run_id=run_id, env=env,
+                            batch_id=str(result.get("batch")),
+                            target_name=index or event, operation="compare",
+                            source_system="oracle+elasticsearch",
+                            rows_requested=None,
+                            rows_returned=ora_rows + es_rows,
+                            rows_changed=changes,
+                            rows_missing=missing,
+                            started_at=now, ended_at=now, duration_ms=None,
+                            status="ok",
+                        )
+                    except Exception:
+                        pass
+                if VERBOSE:
+                    msg = (f"[{event}] batch {result.get('batch')}/{total} "
+                           f"oracle={ora_rows}r es={es_rows}r")
+                    if bar is not None:
+                        bar.write(msg)
+                    else:
+                        print(msg)
     finally:
         if bar is not None:
             bar.close()
+    return agg
+
+
+def _record_compare_summary(run_id: str, event: str, env: str, index: str,
+                            agg: dict, started_at: datetime,
+                            error: Exception | None = None) -> None:
+    """Insert one pipeline_run_summary row for a compare run. Best-effort."""
+    if not run_id:
+        return
+    rows_count = (agg.get("changes") or 0) + (agg.get("missing") or 0)
+    err_msg = None
+    status = "ok"
+    if error is not None:
+        status = "failed"
+        err_msg = f"{type(error).__name__}: {error}"
+    try:
+        run_summary.record_run(
+            run_id=run_id, env=env, target_name=index, operation="compare",
+            rows_count=rows_count,
+            source_file=None,  # compare touches many files per event
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status=status, error=err_msg,
+        )
+    except Exception as e:
+        # Never let summary insertion break the run.
+        print(f"[run-summary] record_run failed for {event}: "
+              f"{type(e).__name__}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
 # Mode runners
 # ---------------------------------------------------------------------------
 
-def run_event_time(conn, event: str, entry: dict, logger, pool) -> None:
+def run_event_time(conn, event: str, entry: dict, logger, pool,
+                   run_id: str = "") -> None:
     if not entry.get("START_TIME") or not entry.get("END_TIME"):
         return _skip(logger, event, "missing START_TIME/END_TIME")
     step_td = parse_step(entry.get("BANCH_VALUE", "HOUR"))
@@ -133,14 +197,25 @@ def run_event_time(conn, event: str, entry: dict, logger, pool) -> None:
             "sql": sql, "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "w_from": w_from, "w_to": w_to, "batch_idx": i,
-            "adapter": adapter,
+            "env": env, "adapter": adapter,
         },
     } for i, (w_from, w_to) in enumerate(windows(start, end, step_td), 1)]
-    _execute_tasks(pool, tasks, event, total)
+    started = datetime.now(timezone.utc)
+    err: Exception | None = None
+    try:
+        agg = _execute_tasks(pool, tasks, event, total,
+                             run_id=run_id, env=env, index=index)
+    except Exception as e:
+        err = e
+        agg = {"changes": 0, "missing": 0}
+        raise
+    finally:
+        _record_compare_summary(run_id, event, env, index, agg, started, err)
     summarize_event(event, env, ev_dir)
 
 
-def run_event_id_range(conn, event: str, entry: dict, logger, pool) -> None:
+def run_event_id_range(conn, event: str, entry: dict, logger, pool,
+                       run_id: str = "") -> None:
     sections = parse_sql_sections(entry["scama"])
     if "range" not in sections or "batch" not in sections:
         raise ValueError(f"{event}: id_range mode needs '-- @range' and '-- @batch' sections in SQL")
@@ -154,7 +229,8 @@ def run_event_id_range(conn, event: str, entry: dict, logger, pool) -> None:
     ev_dir = event_dir(event, env)
     plan = Plan.from_entry(entry)
 
-    df_range, _ = run_tracked(conn, sections["range"], {}, logger, table=event, batch=0)
+    df_range, _ = run_tracked(conn, sections["range"], {}, logger, table=event,
+                               batch=0, env=env, operation="oracle_range_probe")
     if df_range.empty or df_range.iloc[0].isna().all():
         print(f"[{event}] empty range -> nothing to do")
         return
@@ -175,14 +251,25 @@ def run_event_id_range(conn, event: str, entry: dict, logger, pool) -> None:
             "batch_sql": batch_sql, "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "from_id": from_id, "to_id": to_id, "batch_idx": i,
-            "adapter": adapter,
+            "env": env, "adapter": adapter,
         },
     } for i, (from_id, to_id) in enumerate(id_windows(min_id, max_id, step, limit), 1)]
-    _execute_tasks(pool, tasks, event, total)
+    started = datetime.now(timezone.utc)
+    err: Exception | None = None
+    try:
+        agg = _execute_tasks(pool, tasks, event, total,
+                             run_id=run_id, env=env, index=index)
+    except Exception as e:
+        err = e
+        agg = {"changes": 0, "missing": 0}
+        raise
+    finally:
+        _record_compare_summary(run_id, event, env, index, agg, started, err)
     summarize_event(event, env, ev_dir)
 
 
-def run_event_time_union(conn, event: str, entry: dict, logger, pool) -> None:
+def run_event_time_union(conn, event: str, entry: dict, logger, pool,
+                         run_id: str = "") -> None:
     parts = entry.get("parts") or []
     if not parts:
         raise ValueError(f"{event}: time_union needs `parts:` list with sql_file/VALUE_COLM/TIME_DATE per part")
@@ -221,10 +308,20 @@ def run_event_time_union(conn, event: str, entry: dict, logger, pool) -> None:
             "pk": pk, "index": index,
             "event_dir_str": str(ev_dir),
             "w_from": w_from, "w_to": w_to, "batch_idx": i,
-            "adapter": adapter,
+            "env": env, "adapter": adapter,
         },
     } for i, (w_from, w_to) in enumerate(windows(start, end, step_td), 1)]
-    _execute_tasks(pool, tasks, event, total)
+    started = datetime.now(timezone.utc)
+    err: Exception | None = None
+    try:
+        agg = _execute_tasks(pool, tasks, event, total,
+                             run_id=run_id, env=env, index=index)
+    except Exception as e:
+        err = e
+        agg = {"changes": 0, "missing": 0}
+        raise
+    finally:
+        _record_compare_summary(run_id, event, env, index, agg, started, err)
     summarize_event(event, env, ev_dir)
 
 
@@ -257,7 +354,7 @@ def run_pipeline(run_id: str, logger) -> None:
                     continue
                 mode = (entry.get("MODE") or "time").strip().lower()
                 runner = _RUNNERS.get(mode, run_event_time)
-                runner(conn, event, entry, logger, pool)
+                runner(conn, event, entry, logger, pool, run_id=run_id)
         pool.close()
     except Exception as e:
         logger.event("fatal", level="ERROR", error=str(e))

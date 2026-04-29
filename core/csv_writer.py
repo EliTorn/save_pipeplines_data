@@ -1,4 +1,10 @@
-"""CSV scrubbing + per-batch save helpers (Oracle/ES/diffs)."""
+"""CSV scrubbing + per-batch save helpers (Oracle/ES/diffs).
+
+Phase C: local files (CSV + Parquet) are the source of truth. PG no longer
+receives heavy diff/missing rows. DuckDB queries Parquet directly.
+
+save_diffs returns {'changes': N, 'missing': M} so the runner can aggregate
+per-event row counts for pipeline_run_summary."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from core.config import SAVE_CHANGES, SAVE_FULL_CSV, SAVE_MISSING, VERBOSE
+from core.parquet_writer import save_parquet, parquet_path_for
 
 _NL_TRANS = str.maketrans({"\r": " ", "\n": " ", "\t": " "})
 
@@ -57,42 +64,77 @@ def save_es_csv(df: pd.DataFrame, path: Path,
                  path=str(path), rows=len(df))
 
 
+def _save_one(df: pd.DataFrame, csv_path: Path,
+              event: str, batch: int, logger, kind: str) -> None:
+    """Write CSV + Parquet sibling. Both are best-effort; one can fail
+    independently."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    scrubbed = strip_nl(df)
+    try:
+        scrubbed.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        logger.event(f"{kind}_saved", table=event, batch=batch,
+                     path=str(csv_path), rows=len(df))
+    except Exception as e:
+        logger.event(f"{kind}_csv_failed", level="WARN", table=event,
+                     batch=batch, path=str(csv_path), error=str(e))
+    try:
+        pq = parquet_path_for(csv_path)
+        written = save_parquet(scrubbed, pq)
+        if written is not None:
+            logger.event(f"{kind}_parquet_saved", table=event, batch=batch,
+                         path=str(written), rows=len(df))
+    except Exception as e:
+        logger.event(f"{kind}_parquet_failed", level="WARN", table=event,
+                     batch=batch, error=str(e))
+
+
 def save_diffs(diffs: pd.DataFrame, event_dir: Path, stamp: str,
                event: str, batch: int, logger,
-               shaped_ora: "pd.DataFrame | None" = None, pk: str = "id") -> None:
+               shaped_ora: "pd.DataFrame | None" = None,
+               pk: str = "id") -> dict:
+    """Persist diff/missing rows to CSV + Parquet. PG receives no per-row
+    writes — DuckDB reads Parquet for downstream consumers.
+
+    Returns {'changes': N_diff_rows, 'missing': N_missing_rows} so the runner
+    can aggregate per-event totals for pipeline_run_summary."""
+    counts = {"changes": 0, "missing": 0}
     if diffs.empty:
         if VERBOSE:
             print(f"[{event}] batch {batch} diffs:  0 rows (skipped write)")
-        return
+        return counts
+
     changes_dir = event_dir / "changes"
     changes_dir.mkdir(exist_ok=True)
 
-    if SAVE_CHANGES:
-        diff_only = diffs[diffs["status"] == "diff"]
-        if not diff_only.empty:
-            p = changes_dir / f"changes_{stamp}.csv"
-            strip_nl(diff_only).to_csv(p, index=False, encoding="utf-8-sig")
-            logger.event("diffs_saved", table=event, batch=batch, path=str(p), rows=len(diff_only))
-            if VERBOSE:
-                print(f"[{event}] batch {batch} diffs:        {len(diff_only)} rows -> {p}")
+    diff_only = diffs[diffs["status"] == "diff"]
+    if not diff_only.empty and SAVE_CHANGES:
+        p = changes_dir / f"changes_{stamp}.csv"
+        _save_one(diff_only, p, event, batch, logger, "diffs")
+        counts["changes"] = len(diff_only)
+        if VERBOSE:
+            print(f"[{event}] batch {batch} diffs: {len(diff_only)} rows -> {p}")
 
     if not SAVE_MISSING:
-        return
+        return counts
 
     BAD_ID = {"", "none", "nan", "<na>", "null"}
     miss_es = diffs[diffs["status"] == "missing_in_es"]
-    if not miss_es.empty and shaped_ora is not None and pk in shaped_ora.columns:
-        ids = {i for i in miss_es[pk].astype(str).str.strip().unique()
-               if i and i.lower() not in BAD_ID}
-        if ids:
-            sa = shaped_ora.copy()
-            sa[pk] = sa[pk].astype(str).str.strip()
-            sa = sa[~sa[pk].str.lower().isin(BAD_ID)]
-            full = sa[sa[pk].isin(ids)].copy()
-            if not full.empty:
-                full["error"] = "missing_in_es"
-                p = changes_dir / f"missing_in_es_{stamp}.csv"
-                strip_nl(full).to_csv(p, index=False, encoding="utf-8-sig")
-                logger.event("missing_in_es_saved", table=event, batch=batch, path=str(p), rows=len(full))
-                if VERBOSE:
-                    print(f"[{event}] batch {batch} missing_in_es: {len(full)} rows -> {p}")
+    if miss_es.empty or shaped_ora is None or pk not in shaped_ora.columns:
+        return counts
+    ids = {i for i in miss_es[pk].astype(str).str.strip().unique()
+           if i and i.lower() not in BAD_ID}
+    if not ids:
+        return counts
+    sa = shaped_ora.copy()
+    sa[pk] = sa[pk].astype(str).str.strip()
+    sa = sa[~sa[pk].str.lower().isin(BAD_ID)]
+    full = sa[sa[pk].isin(ids)].copy()
+    if full.empty:
+        return counts
+    full["error"] = "missing_in_es"
+    p = changes_dir / f"missing_in_es_{stamp}.csv"
+    _save_one(full, p, event, batch, logger, "missing_in_es")
+    counts["missing"] = len(full)
+    if VERBOSE:
+        print(f"[{event}] batch {batch} missing_in_es: {len(full)} rows -> {p}")
+    return counts

@@ -83,26 +83,29 @@ For each event in `settings/events.yaml`:
 2. Shape rows into ES-keyed columns using `mapping.csv` + adapter lambdas.
 3. Pull the matching ES window/IDs.
 4. Compare per-PK, field-by-field; emit `out/<EVENT>/<env>/changes/`:
-   - `changes_<stamp>.csv` — field-level diffs.
-   - `missing_in_es_<stamp>.csv` — full Oracle rows not present in ES.
-5. Mirror outputs to Postgres (`pipeline_changes` / `pipeline_missing`)
-   so a separate apply step can act on them later.
-6. `apply_changes` reads pending rows from Postgres (or CSV fallback)
-   and writes back to ES with adapter-driven type coercion + per-doc
-   `before_apply` hook.
+   - `changes_<stamp>.{csv,parquet}` — field-level diffs.
+   - `missing_in_es_<stamp>.{csv,parquet}` — full Oracle rows not present in ES.
+5. Local files are the source of truth. **Nothing heavy is written to
+   Postgres** — only small observability rows (timing, counts, status).
+6. `apply_changes` reads pending rows from local Parquet via DuckDB by
+   default (`--source duckdb`) and writes back to ES with adapter-driven
+   type coercion + per-doc `before_apply` hook.
 
 ## How the pipeline works
 
 ```
-Oracle SELECT  ─┐                       ┌─→ changes_*.csv
+Oracle SELECT  ─┐                       ┌─→ changes_*.{csv,parquet}
                 │                       │
-                ├─→ transform (mapping) ┼─→ missing_in_es_*.csv
+                ├─→ transform (mapping) ┼─→ missing_in_es_*.{csv,parquet}
                 │                       │
 ES query       ─┴─→ compare (per PK) ──┘
-                                         └─→ Postgres mirror
+                                         └─→ DuckDB views over local files
 
-apply_changes:
-  Postgres pending  ─→ adapter.coerce_for_es ─→ adapter.before_apply ─→ ES
+apply_changes (default --source duckdb):
+  v_changes / v_missing → coerce_for_es → before_apply → ES
+
+PostgreSQL (sidecar, best-effort, never blocks):
+  pipeline_run_summary, connection_log, query_log, batch_log
 ```
 
 ## How to run
@@ -144,9 +147,14 @@ Apply diffs back to ES for one event:
 python -m apply_changes.apply_changes --event PLAYERBONUS --env prod --mode both
 # or:  poetry run apply-changes --event PLAYERBONUS --env prod --mode both
 #
-# --mode  changes | missing | both
-# --env   stage | prod
-# --dry   print what would happen, no writes
+# --mode    changes | missing | both
+# --env     stage | prod
+# --dry     print what would happen, no writes
+# --source  duckdb (default) | pg | csv | auto
+#           duckdb : read pending diffs from local Parquet via DuckDB
+#           pg     : legacy fallback — read from pipeline_changes
+#           csv    : read changes_*.csv files directly
+#           auto   : try pg → duckdb → csv
 # --no-refresh  skip pulling fresh ES schema before validation
 ```
 

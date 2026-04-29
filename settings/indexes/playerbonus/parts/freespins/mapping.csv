@@ -21,7 +21,7 @@ CREATEDDATE+EXPIERY_DAYS,expirationDate,compose_expiration_from_days
 EXPIERY_DAYS,expirationDays,convert_int_to_string
 BONUSNAME,bonusName,
 FREESPINS,freeSpinAmount,
-FREESPINS_LEFT,freeSpinsLeft,convert_to_int_strict
+SPECIALBONUSTYPEID+FREESPINS_LEFT,freeSpinsLeft,compose_freespins_left
 SPECIALBONUSTYPEID+FREESPINS_LEFT,chipCountLeft,compose_chip_count_left_freespins
 DENOMINATION+LINES+COINS+MULTIPLIER,worth,compose_worth_freespins_wheelspin
 AMOUNT_WON,amountWon,

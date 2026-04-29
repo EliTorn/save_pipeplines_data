@@ -37,6 +37,7 @@ class RunLogger(RunLoggerBase):
     EVENTS_CSV = EVENTS_CSV
     QUERIES_CSV = QUERIES_CSV
     CONN_FIELDS = CONN_FIELDS
+    SYSTEM_NAME = "elasticsearch"
 
 
 def get_run_logger(run_id: str | None = None) -> RunLogger:

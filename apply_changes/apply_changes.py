@@ -50,8 +50,12 @@ from _pipeline_env import env_truthy, normalize_es_env  # noqa: E402
 from apply_changes import es_schema as es_schema_io
 from apply_changes import pg_tracking
 from apply_changes import pg_source
+from apply_changes import duckdb_source
+from connect_into_postgres import run_summary, observability
+from core import duckdb_catalog
 from core.adapter_loader import get_adapter
-from core.coerce import field_types, now_es_iso
+from core.coerce import field_types
+from datetime import timezone as _tz
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 BATCH_SIZE = int(os.getenv("APPLY_BATCH_SIZE", "1000"))
 POLL_INTERVAL = float(os.getenv("APPLY_POLL_INTERVAL_SEC", "2.0"))
@@ -204,38 +208,53 @@ def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
                   schema: dict[str, dict] | None = None,
                   event: str | None = None, env: str | None = None,
                   force: bool = False, run_id: str | None = None,
-                  data_source: str = "auto") -> None:
-    """data_source: 'pg' = read pipeline_changes (applied_ts IS NULL),
-                    'csv' = read changes_*.csv from disk (legacy),
-                    'auto' = try PG first, fall back to CSV."""
+                  data_source: str = "duckdb") -> None:
+    """data_source: 'pg'     = read pipeline_changes (applied_ts IS NULL) — legacy,
+                    'duckdb' = read v_changes (Parquet) — default,
+                    'csv'    = read changes_*.csv from disk (legacy),
+                    'auto'   = try PG first, then DuckDB, then CSV."""
+    started_at = datetime.now(_tz.utc)
     docs: dict[str, dict] = {}
     audit_changes: dict[str, dict] = {}
     file_doc_ids: dict[Path, set[str]] = {}
-    use_pg = False
+    chosen_source: str | None = None
 
-    # Try Postgres first unless explicitly forced to CSV.
+    # Source priority: explicit choice wins; auto = pg -> duckdb -> csv.
+    def _consume(rows: list[dict], label: str) -> None:
+        nonlocal chosen_source
+        chosen_source = label
+        print(f"[apply] reading {len(rows)} pending diff row(s) from {label}")
+        files_seen: dict[str, set[str]] = {}
+        for r in rows:
+            doc_id = (str(r.get(pk) or r.get("id") or "")).strip()
+            field = (r.get("field") or "").strip()
+            if not doc_id or not field or field == "*":
+                continue
+            new_val = adapter.coerce_for_es(field, r.get("oracle_value"))
+            old_val = r.get("es_value")
+            docs.setdefault(doc_id, {})[field] = new_val
+            audit_changes.setdefault(doc_id, {})[field] = {"old": old_val, "new": new_val}
+            src = r.get("source_file") or ""
+            files_seen.setdefault(src, set()).add(doc_id)
+        for src, ids in files_seen.items():
+            # Always key by CSV-rel path so pg_tracking.mark_applied works.
+            csv_rel = duckdb_source._parquet_to_csv_rel(src)
+            file_doc_ids[_ROOT / "out" / csv_rel] = ids
+
     if event and env and data_source in ("pg", "auto") and pg_source.is_available():
         pg_rows = pg_source.load_pending_changes(event, env, pk=pk)
         if pg_rows or data_source == "pg":
-            use_pg = True
-            print(f"[apply] reading {len(pg_rows)} pending diff row(s) from Postgres "
-                  f"(pipeline_changes WHERE applied_ts IS NULL)")
-            files_seen: dict[str, set[str]] = {}
-            for r in pg_rows:
-                doc_id = (str(r.get(pk) or r.get("id") or "")).strip()
-                field = (r.get("field") or "").strip()
-                if not doc_id or not field or field == "*":
-                    continue
-                new_val = adapter.coerce_for_es(field, r.get("oracle_value"))
-                old_val = r.get("es_value")
-                docs.setdefault(doc_id, {})[field] = new_val
-                audit_changes.setdefault(doc_id, {})[field] = {"old": old_val, "new": new_val}
-                src = r.get("source_file") or ""
-                files_seen.setdefault(src, set()).add(doc_id)
-            for src, ids in files_seen.items():
-                file_doc_ids[_ROOT / "out" / src] = ids
+            _consume(pg_rows, "postgres (pipeline_changes WHERE applied_ts IS NULL)")
 
-    if not use_pg:
+    if chosen_source is None and event and env \
+            and data_source in ("duckdb", "auto") \
+            and duckdb_source.is_available():
+        dk_rows = duckdb_source.load_pending_changes(event, env, pk=pk)
+        if dk_rows or data_source == "duckdb":
+            _consume(dk_rows, "duckdb (v_changes from local Parquet)")
+
+    if chosen_source is None:
+        chosen_source = "csv"
         # Legacy CSV path.
         files = sorted(changes_dir.glob("changes_*.csv"))
         if not files:
@@ -267,10 +286,18 @@ def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
             file_doc_ids[f] = ids_here
 
     if not docs:
-        print("no usable diffs"); return
+        print("no usable diffs")
+        if event and env and run_id:
+            run_summary.record_run(
+                run_id=run_id, env=env, target_name=index, operation="apply_changes",
+                rows_count=0, started_at=started_at,
+                ended_at=datetime.now(_tz.utc), status="ok",
+                error=None,
+            )
+        return
     print(f"docs to update: {len(docs)}  "
           f"(across {len(file_doc_ids)} source file(s), "
-          f"source={'postgres' if use_pg else 'csv'})")
+          f"source={chosen_source})")
 
     # Pre-flight schema validation across the whole plan (incl. adapter-added fields).
     if schema:
@@ -319,6 +346,7 @@ def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
             },
         }
         idx_n = i // BATCH_SIZE + 1
+        batch_started = datetime.now(_tz.utc)
         try:
             r = _post(url,
                       f"/{index}/_update_by_query?wait_for_completion=false&conflicts=proceed&refresh=false",
@@ -333,11 +361,61 @@ def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
                 for did in chunk_ids:
                     audit.update(did, audit_changes.get(did, {}), idx_n)
                 audit.update_batch_result(idx_n, chunk_ids, u, c, fcount)
+            batch_ended = datetime.now(_tz.utc)
+            duration_ms = int((batch_ended - batch_started).total_seconds() * 1000)
+            try:
+                observability.log_batch(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    target_name=index, operation="apply_changes",
+                    source_system="elasticsearch",
+                    rows_requested=len(chunk_ids), rows_returned=u,
+                    rows_changed=u, rows_missing=None,
+                    started_at=batch_started, ended_at=batch_ended,
+                    duration_ms=duration_ms,
+                    status="failed" if fcount > 0 else "ok",
+                    error=(f"{fcount} failures, {c} conflicts" if fcount else None),
+                )
+                observability.log_query(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    system_name="elasticsearch", target_name=index,
+                    operation="es_bulk_update",
+                    query_text=json.dumps(body, default=str)[:8000],
+                    started_at=batch_started, ended_at=batch_ended,
+                    duration_ms=duration_ms,
+                    rows_returned=u, rows_affected=u,
+                    status="failed" if fcount > 0 else "ok",
+                    error=(f"{fcount} failures, {c} conflicts" if fcount else None),
+                )
+            except Exception:
+                pass
         except Exception as e:
             failures += len(chunk_ids)
             print(f"  changes batch {idx_n}/{batches} FAILED: {e}")
             if audit:
                 audit.update_batch_result(idx_n, chunk_ids, 0, 0, len(chunk_ids))
+            try:
+                observability.log_batch(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    target_name=index, operation="apply_changes",
+                    source_system="elasticsearch",
+                    rows_requested=len(chunk_ids), rows_returned=0,
+                    rows_changed=0, rows_missing=None,
+                    started_at=batch_started, ended_at=datetime.now(_tz.utc),
+                    duration_ms=None, status="failed",
+                    error=str(e),
+                )
+                observability.log_query(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    system_name="elasticsearch", target_name=index,
+                    operation="es_bulk_update",
+                    query_text=json.dumps(body, default=str)[:8000],
+                    started_at=batch_started, ended_at=datetime.now(_tz.utc),
+                    duration_ms=None,
+                    rows_returned=0, rows_affected=0,
+                    status="failed", error=str(e),
+                )
+            except Exception:
+                pass
     print(f"changes done: updated={updated} conflicts={conflicts} failures={failures}")
 
     if event and env and not dry:
@@ -357,6 +435,19 @@ def apply_changes(changes_dir: Path, index: str, adapter, pk: str,
                     marked += 1
             print(f"[pg-tracking] marked {marked}/{n_sources} file(s) as applied")
 
+    if event and env and run_id:
+        # one summary row per (run, env, index, operation)
+        rep_src = next(iter(file_doc_ids), None)
+        rep = str(rep_src.relative_to(_ROOT)) if rep_src else None
+        run_summary.record_run(
+            run_id=run_id, env=env, target_name=index, operation="apply_changes",
+            rows_count=updated, source_file=rep if len(file_doc_ids) == 1 else None,
+            started_at=started_at, ended_at=datetime.now(_tz.utc),
+            status="failed" if failures > 0 else "ok",
+            error=(f"{failures} failures, {conflicts} conflicts"
+                   if failures > 0 else None),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mode B: insert missing docs (missing_in_es_*.csv) — never overwrite
@@ -368,28 +459,41 @@ def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
                   schema: dict[str, dict] | None = None,
                   event: str | None = None, env: str | None = None,
                   force: bool = False, run_id: str | None = None,
-                  data_source: str = "auto") -> None:
+                  data_source: str = "duckdb") -> None:
+    started_at = datetime.now(_tz.utc)
     rows_total: list[dict] = []
     file_row_counts: dict[Path, int] = {}
-    use_pg = False
+    chosen_source: str | None = None
+
+    def _consume(rows: list[dict], label: str) -> None:
+        nonlocal chosen_source
+        chosen_source = label
+        print(f"[apply] reading {len(rows)} pending missing row(s) from {label}")
+        files_seen: dict[str, int] = {}
+        for r in rows:
+            src = r.pop("source_file", "") or ""
+            if "error" in r:
+                r.pop("error", None)
+            rows_total.append(r)
+            files_seen[src] = files_seen.get(src, 0) + 1
+        for src, n in files_seen.items():
+            csv_rel = duckdb_source._parquet_to_csv_rel(src)
+            file_row_counts[_ROOT / "out" / csv_rel] = n
 
     if event and env and data_source in ("pg", "auto") and pg_source.is_available():
         pg_rows = pg_source.load_pending_missing(event, env, pk=pk)
         if pg_rows or data_source == "pg":
-            use_pg = True
-            print(f"[apply] reading {len(pg_rows)} pending missing row(s) from Postgres "
-                  f"(pipeline_missing WHERE applied_ts IS NULL)")
-            files_seen: dict[str, int] = {}
-            for r in pg_rows:
-                src = r.pop("source_file", "") or ""
-                if "error" in r:
-                    r.pop("error", None)
-                rows_total.append(r)
-                files_seen[src] = files_seen.get(src, 0) + 1
-            for src, n in files_seen.items():
-                file_row_counts[_ROOT / "out" / src] = n
+            _consume(pg_rows, "postgres (pipeline_missing WHERE applied_ts IS NULL)")
 
-    if not use_pg:
+    if chosen_source is None and event and env \
+            and data_source in ("duckdb", "auto") \
+            and duckdb_source.is_available():
+        dk_rows = duckdb_source.load_pending_missing(event, env, pk=pk)
+        if dk_rows or data_source == "duckdb":
+            _consume(dk_rows, "duckdb (v_missing from local Parquet)")
+
+    if chosen_source is None:
+        chosen_source = "csv"
         files = sorted(changes_dir.glob("missing_in_es_*.csv"))
         if not files:
             print("no missing_in_es_*.csv files found"); return
@@ -412,10 +516,17 @@ def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
             rows_total.extend(recs)
             file_row_counts[f] = len(recs)
     if not rows_total:
-        print("no missing rows"); return
+        print("no missing rows")
+        if event and env and run_id:
+            run_summary.record_run(
+                run_id=run_id, env=env, target_name=index, operation="apply_missing",
+                rows_count=0, started_at=started_at,
+                ended_at=datetime.now(_tz.utc), status="ok", error=None,
+            )
+        return
     print(f"docs to insert: {len(rows_total)} "
           f"(across {len(file_row_counts)} source file(s), "
-          f"source={'postgres' if use_pg else 'csv'})")
+          f"source={chosen_source})")
 
     # Coerce per-field, drop empty values
     docs: list[tuple[str, dict]] = []
@@ -462,6 +573,8 @@ def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
             bulk_lines.append(json.dumps(body, default=str))
         bulk_body = "\n".join(bulk_lines) + "\n"
         idx_n = i // BATCH_SIZE + 1
+        batch_started = datetime.now(_tz.utc)
+        batch_created = batch_exists = batch_errors = 0
         try:
             r = requests.post(url + "/_bulk?refresh=false", auth=auth, verify=verify,
                               data=bulk_body,
@@ -474,22 +587,73 @@ def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
                 op = item.get("create", {})
                 status = op.get("status")
                 if status == 201:
-                    created += 1; result = "created"; err = None
+                    created += 1; batch_created += 1; result = "created"; err = None
                 elif status == 409:
-                    exists += 1; result = "exists"; err = None
+                    exists += 1; batch_exists += 1; result = "exists"; err = None
                 else:
-                    errors += 1; result = "error"
+                    errors += 1; batch_errors += 1; result = "error"
                     err = json.dumps(op.get("error"), default=str) if op.get("error") else None
                 if audit and j < len(chunk):
                     did, body = chunk[j]
                     audit.insert(did, body, status or 0, result, idx_n, err)
             print(f"  missing batch {idx_n}/{batches}: created={created} skipped(exists)={exists} errors={errors}")
+            batch_ended = datetime.now(_tz.utc)
+            duration_ms = int((batch_ended - batch_started).total_seconds() * 1000)
+            try:
+                observability.log_batch(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    target_name=index, operation="apply_missing",
+                    source_system="elasticsearch",
+                    rows_requested=len(chunk), rows_returned=batch_created,
+                    rows_changed=batch_created, rows_missing=batch_exists,
+                    started_at=batch_started, ended_at=batch_ended,
+                    duration_ms=duration_ms,
+                    status="failed" if batch_errors > 0 else "ok",
+                    error=(f"{batch_errors} errors" if batch_errors else None),
+                )
+                observability.log_query(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    system_name="elasticsearch", target_name=index,
+                    operation="es_bulk_create",
+                    query_text=f"_bulk create n={len(chunk)} target={index}",
+                    started_at=batch_started, ended_at=batch_ended,
+                    duration_ms=duration_ms,
+                    rows_returned=batch_created, rows_affected=batch_created,
+                    status="failed" if batch_errors > 0 else "ok",
+                    error=(f"{batch_errors} errors" if batch_errors else None),
+                )
+            except Exception:
+                pass
         except Exception as e:
             errors += len(chunk)
             print(f"  missing batch {idx_n}/{batches} FAILED: {e}")
             if audit:
                 for did, body in chunk:
                     audit.insert(did, body, 0, "error", idx_n, str(e))
+            try:
+                end_ts = datetime.now(_tz.utc)
+                observability.log_batch(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    target_name=index, operation="apply_missing",
+                    source_system="elasticsearch",
+                    rows_requested=len(chunk), rows_returned=0,
+                    rows_changed=0, rows_missing=None,
+                    started_at=batch_started, ended_at=end_ts,
+                    duration_ms=None, status="failed",
+                    error=str(e),
+                )
+                observability.log_query(
+                    run_id=run_id, env=env, batch_id=str(idx_n),
+                    system_name="elasticsearch", target_name=index,
+                    operation="es_bulk_create",
+                    query_text=f"_bulk create n={len(chunk)} target={index}",
+                    started_at=batch_started, ended_at=end_ts,
+                    duration_ms=None,
+                    rows_returned=0, rows_affected=0,
+                    status="failed", error=str(e),
+                )
+            except Exception:
+                pass
     print(f"missing done: created={created} skipped(exists)={exists} errors={errors}")
 
     if event and env and not dry:
@@ -509,6 +673,137 @@ def apply_missing(changes_dir: Path, index: str, adapter, pk: str,
                     marked += 1
             print(f"[pg-tracking] marked {marked}/{n_sources} file(s) as applied")
 
+    if event and env and run_id:
+        rep_src = next(iter(file_row_counts), None)
+        rep = str(rep_src.relative_to(_ROOT)) if rep_src else None
+        run_summary.record_run(
+            run_id=run_id, env=env, target_name=index, operation="apply_missing",
+            rows_count=created, source_file=rep if len(file_row_counts) == 1 else None,
+            started_at=started_at, ended_at=datetime.now(_tz.utc),
+            status="failed" if errors > 0 else "ok",
+            error=(f"{errors} errors, {exists} exists"
+                   if errors > 0 else None),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Source diagnostics — answers "why did apply_changes find 0 rows?".
+# ---------------------------------------------------------------------------
+
+def _diagnose_sources(event: str, env: str, source: str, changes_dir: Path) -> None:
+    """Print a short, actionable summary of every potential source so a
+    0-row result is explainable. Runs before any data is consumed; cheap."""
+    print()
+    print("[diag] -------------------------------------------------------------")
+    print(f"[diag] event={event} env={env} requested_source={source}")
+    print(f"[diag] changes_dir: {changes_dir}")
+    if not changes_dir.is_dir():
+        print("[diag]   NOT A DIRECTORY — no local files for this (event, env)")
+    else:
+        ch_csv  = sorted(changes_dir.glob("changes_*.csv"))
+        ch_pq   = sorted(changes_dir.glob("changes_*.parquet"))
+        mi_csv  = sorted(changes_dir.glob("missing_in_es_*.csv"))
+        mi_pq   = sorted(changes_dir.glob("missing_in_es_*.parquet"))
+        print(f"[diag]   changes_*.csv     : {len(ch_csv)} file(s)")
+        for f in ch_csv[:3]:
+            print(f"[diag]     - {f.name}  ({f.stat().st_size:,} bytes)")
+        if len(ch_csv) > 3: print(f"[diag]     ... +{len(ch_csv)-3} more")
+        print(f"[diag]   changes_*.parquet : {len(ch_pq)} file(s)")
+        for f in ch_pq[:3]:
+            print(f"[diag]     - {f.name}  ({f.stat().st_size:,} bytes)")
+        if len(ch_pq) > 3: print(f"[diag]     ... +{len(ch_pq)-3} more")
+        print(f"[diag]   missing_in_es_*.csv     : {len(mi_csv)} file(s)")
+        print(f"[diag]   missing_in_es_*.parquet : {len(mi_pq)} file(s)")
+
+    # DuckDB side — show catalog path, view definitions, row counts,
+    # sample doc_ids for this (event, env).
+    try:
+        from core import duckdb_catalog
+        print(f"[diag] duckdb catalog: {duckdb_catalog.DUCKDB_PATH}  "
+              f"exists={duckdb_catalog.DUCKDB_PATH.is_file()}")
+
+        df = duckdb_catalog.query(
+            "SELECT view_name, sql FROM duckdb_views "
+            "WHERE view_name IN ('v_changes', 'v_missing')"
+        )
+        if df is not None and len(df) > 0:
+            for _, r in df.iterrows():
+                preview = (r["sql"] or "").split("\n", 1)[0][:160]
+                print(f"[diag]   view {r['view_name']}: {preview}")
+
+        # Total rows in each view.
+        for view in ("v_changes", "v_missing"):
+            try:
+                d = duckdb_catalog.query(f"SELECT COUNT(*) AS n FROM {view}")
+                n = int(d.iloc[0, 0]) if d is not None and len(d) > 0 else 0
+                print(f"[diag]   {view}: {n} total row(s)")
+            except Exception as e:
+                print(f"[diag]   {view}: query failed: {type(e).__name__}: {e}")
+
+        # Filter rows for this (event, env). Mirror the regex used by
+        # duckdb_source so we see what apply will actually see.
+        for view in ("v_changes", "v_missing"):
+            try:
+                sql = (
+                    f"SELECT COUNT(*) AS n FROM {view} "
+                    f"WHERE regexp_extract(replace(filename, chr(92), '/'), "
+                    f"  '/out/([^/]+)/([^/]+)/changes/', 1) = ? "
+                    f"  AND regexp_extract(replace(filename, chr(92), '/'), "
+                    f"  '/out/([^/]+)/([^/]+)/changes/', 2) = ?"
+                )
+                d = duckdb_catalog.query(sql, (event, env))
+                n = int(d.iloc[0, 0]) if d is not None and len(d) > 0 else 0
+                print(f"[diag]   {view} WHERE event='{event}' env='{env}': {n} row(s)")
+                if n > 0 and view == "v_changes":
+                    sample = duckdb_catalog.query(
+                        f"SELECT id, field, status, "
+                        f"  regexp_extract(replace(filename, chr(92), '/'), "
+                        f"  '/([^/]+\\.parquet)$', 1) AS file "
+                        f"FROM {view} "
+                        f"WHERE regexp_extract(replace(filename, chr(92), '/'), "
+                        f"  '/out/([^/]+)/([^/]+)/changes/', 1) = ? "
+                        f"  AND regexp_extract(replace(filename, chr(92), '/'), "
+                        f"  '/out/([^/]+)/([^/]+)/changes/', 2) = ? "
+                        f"LIMIT 5",
+                        (event, env),
+                    )
+                    if sample is not None and len(sample) > 0:
+                        print(f"[diag]   sample rows from {view}:")
+                        for _, r in sample.iterrows():
+                            print(f"[diag]     id={r['id']!r:<18} field={r['field']!r:<22} "
+                                  f"status={r['status']!r:<12} file={r['file']}")
+            except Exception as e:
+                print(f"[diag]   filtered {view} query failed: "
+                      f"{type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[diag] duckdb diagnostics failed: {type(e).__name__}: {e}")
+
+    # PG side — only show if it could be a source for this run.
+    if source in ("pg", "auto"):
+        try:
+            available = pg_source.is_available()
+            print(f"[diag] pg_source.is_available(): {available}")
+            if available:
+                cnt = pg_source.pending_counts(env).get(event, {})
+                print(f"[diag]   pipeline_changes/missing for {event}/{env}: {cnt}")
+        except Exception as e:
+            print(f"[diag] pg diagnostics failed: {type(e).__name__}: {e}")
+
+    # pipeline_apply_batches: which CSVs are already marked applied?
+    try:
+        already = pg_tracking.fetch_applied_files(event, env, "changes")
+        print(f"[diag] pipeline_apply_batches: {len(already)} 'changes' file(s) "
+              f"already applied for {event}/{env}")
+        if already:
+            for s in list(already)[:3]:
+                print(f"[diag]   already-applied: {s}")
+            if len(already) > 3: print(f"[diag]   ... +{len(already)-3} more")
+    except Exception as e:
+        print(f"[diag] pg_tracking diagnostics failed: {type(e).__name__}: {e}")
+
+    print("[diag] -------------------------------------------------------------")
+    print()
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -524,9 +819,10 @@ def main():
                    help="skip auto-refresh of the ES schema CSV before validation")
     p.add_argument("--force", action="store_true",
                    help="re-apply CSVs even if pipeline_apply_batches already records them")
-    p.add_argument("--source", choices=["pg", "csv", "auto"], default="auto",
-                   help="where to read pending diffs/missing from (default: auto = "
-                        "Postgres first, fall back to CSV)")
+    p.add_argument("--source", choices=["pg", "duckdb", "csv", "auto"],
+                   default="duckdb",
+                   help="where to read pending diffs/missing from "
+                        "(default: duckdb. 'auto' = PG → DuckDB → CSV.)")
     args = p.parse_args()
     import uuid as _uuid
     run_id = _uuid.uuid4().hex[:12]
@@ -549,11 +845,27 @@ def main():
         sys.exit(f"changes dir not found: {changes_dir} "
                  f"(env={args.env}, --source=csv requires local files)")
 
+    # CRITICAL: refresh the DuckDB catalog so v_changes / v_missing point at
+    # the current set of parquet files. If the catalog was created earlier
+    # when out/ was empty, the views were registered as empty placeholders
+    # and would silently return 0 rows here.
+    if args.source in ("duckdb", "auto"):
+        try:
+            duckdb_catalog.init_catalog()
+        except Exception as e:
+            print(f"[duckdb] init_catalog failed (continuing): "
+                  f"{type(e).__name__}: {e}")
+
     url, auth, verify = es_client(args.env)
     print(f"event={args.event} index={index} pk={pk} env={args.env} url={url} dry={args.dry}")
     print(f"adapter={type(adapter).__module__}.{type(adapter).__name__}")
     print(f"changes dir: {changes_dir}")
     print(f"types known for {len(types)} fields")
+    print(f"source priority: {args.source}")
+
+    # Diagnostic dump of what's actually on disk + in DuckDB views, so 0-row
+    # results are explainable without guesswork.
+    _diagnose_sources(args.event, args.env, args.source, changes_dir)
 
     # Auto-refresh ES schema CSV from prod (always prod regardless of --env).
     schema_csv = schema_csv_path(index)
@@ -596,15 +908,7 @@ def main():
             audit.close({"event": args.event, "env": args.env, "mode": args.mode})
         pg_tracking.close()
         pg_source.close()
-
-    if not args.dry and not env_truthy("PIPELINE_SKIP_PG_SYNC"):
-        try:
-            from connect_into_postgres.sync_out import run_sync
-            print("[pg-sync] mirroring out/ -> Postgres")
-            run_sync(only="apply_audit,changes,missing,summary,logs")
-        except Exception as e:
-            print(f"[pg-sync] skipped: {type(e).__name__}: {e}")
-
+        duckdb_source.close()
 
 if __name__ == "__main__":
     main()
