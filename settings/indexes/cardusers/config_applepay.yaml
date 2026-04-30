@@ -1,0 +1,8 @@
+sql_file: sql/applepay.sql
+VALUE_COLM: mapping/applepay.csv
+MODE: id_range
+ES_ENV: prod
+PK: id
+ID_COLUMN: AP.DPAN_ID
+BANCH_VALUE: 5000
+INDEX_NAME: cardusers

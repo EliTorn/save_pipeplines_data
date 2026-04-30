@@ -55,6 +55,7 @@ from apply_changes import pg_tracking
 from core.config import PIPELINE_WORKERS
 from core.duckdb_catalog import init_catalog as init_duckdb_catalog
 from core.runner import run_pipeline
+import pipeline_logging
 
 
 def main() -> None:
@@ -71,6 +72,29 @@ def main() -> None:
     )
     print(f"Run {run_id} | conn -> {CONN_CSV.name} | events -> {EVENTS_CSV.name} | queries -> {QUERIES_CSV.name}")
     print(f"Pipeline workers: {PIPELINE_WORKERS}")
+
+    v2_logger = None
+    if pipeline_logging.is_enabled():
+        try:
+            pipeline_logging.pg_summary.init_schema()
+            v2_logger = pipeline_logging.get_run_logger(
+                env="unknown", trigger="manual", run_id=run_id,
+                args={"argv": sys.argv[1:]},
+            )
+            v2_logger.connection(
+                system="oracle", target=SERVICE_NAME, host=DB_HOST,
+                port=PORT, user=USERNAME,
+            )
+            v2_logger.connection(
+                system="elasticsearch", target=ES_URL, host=ES_URL,
+                user=ES_USER,
+            )
+            print(f"[v2] logging enabled -> {v2_logger.run_dir}", flush=True)
+            logger._v2 = v2_logger  # piggyback on legacy logger object
+        except Exception as e:
+            print(f"[v2] init failed (continuing with legacy only): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            v2_logger = None
 
     # Loop 6: legacy heavy tables are gone. We only ensure the active small
     # tables (run summary, observability logs, apply-batch tracking).
@@ -93,7 +117,29 @@ def main() -> None:
         print(f"[duckdb] init_catalog raised (continuing): {type(e).__name__}: {e}",
               flush=True)
 
-    run_pipeline(run_id, logger)
+    fatal_err: Exception | None = None
+    try:
+        run_pipeline(run_id, logger)
+    except Exception as e:
+        fatal_err = e
+        raise
+    finally:
+        if v2_logger is not None:
+            if fatal_err is not None:
+                try:
+                    v2_logger._record_error(
+                        where="main.run_pipeline", error=fatal_err,
+                    )
+                except Exception:
+                    pass
+            try:
+                v2_logger.close(
+                    final_error=f"{type(fatal_err).__name__}: {fatal_err}"
+                    if fatal_err else None,
+                )
+            except Exception as e:
+                print(f"[v2] close failed (silenced): "
+                      f"{type(e).__name__}: {e}", flush=True)
 
 
 if __name__ == "__main__":

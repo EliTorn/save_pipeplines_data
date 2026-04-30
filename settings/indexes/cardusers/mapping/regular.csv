@@ -1,0 +1,15 @@
+filed_orcal,filed_es,funciton_lambda
+id,id,
+CARDID,cardId,convert_int_to_string
+CREATIONDATE,creationDate,convert_time_to_string
+HIDDEN_CARD_NUMBER,lastFourDigits,convert_last_four
+EXPYEAR+EXPMONTH,expiryDate,compose_regular_expiry_date
+BLACKLIST,isWhitelisted,convert_blacklist_to_iswhitelisted
+BLACKLIST,isBlacklisted,convert_blacklist_to_isblacklisted
+VERIFIED,isVerified,convert_verified_to_isverified
+COMPANYNAME,companyName,
+STATUS,paymentMode,
+HIDDEN_CARD_NUMBER,bin,convert_first_six
+EXTERNALUSERIDS,externalUserIds,convert_str_to_list
+USERIDS,userIds,convert_str_to_list
+CARDID,paymentSystem,constant_regular_payment_system

@@ -12,10 +12,14 @@ __pycache__/
 # Pipeline runtime artifacts
 out/
 connect_into_*/logging/
+logs/
+duckdb_data/
 *.log
+*.duckdb
 
 # IDE / OS
 .idea/
 .vscode/
+.claude/
 .DS_Store
 Thumbs.db

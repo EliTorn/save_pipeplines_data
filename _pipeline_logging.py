@@ -71,6 +71,26 @@ def _pg_mirror_query(row: dict, system_name: str) -> None:
         pass
 
 
+def _v2_mirror_event(v2, row: dict, run_id: str) -> None:
+    """Best-effort mirror of a legacy event row into v2 events parquet."""
+    try:
+        from pipeline_logging._legacy_adapter import event_row_to_v2
+        v2.sink.append("events", event_row_to_v2(row, run_id))
+    except Exception as e:
+        print(f"[v2-mirror:event] failed (silenced): "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _v2_mirror_query(v2, row: dict, system_name: str, run_id: str) -> None:
+    """Best-effort mirror of a legacy QueryRecord row into v2 queries parquet."""
+    try:
+        from pipeline_logging._legacy_adapter import query_row_to_v2
+        v2.sink.append("queries", query_row_to_v2(row, system_name, run_id))
+    except Exception as e:
+        print(f"[v2-mirror:query] failed (silenced): "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
 def _append_row(path: Path, fields: list[str], row: dict) -> None:
     with _lock:
         new_file = not path.exists()
@@ -168,7 +188,11 @@ class QueryRecord:
     def __exit__(self, exc_type, exc, tb) -> bool:
         row = self._build_row(exc)
         _append_row(self.logger.QUERIES_CSV, QUERY_FIELDS, row)
-        _pg_mirror_query(row, getattr(self.logger, "SYSTEM_NAME", "unknown"))
+        system = getattr(self.logger, "SYSTEM_NAME", "unknown")
+        _pg_mirror_query(row, system)
+        v2 = getattr(self.logger, "_v2", None)
+        if v2 is not None:
+            _v2_mirror_query(v2, row, system, self.logger.run_id)
         return False
 
 
@@ -216,6 +240,9 @@ class RunLoggerBase:
             **fields,
         }
         _append_row(self.EVENTS_CSV, EVENT_FIELDS, row)
+        v2 = getattr(self, "_v2", None)
+        if v2 is not None:
+            _v2_mirror_event(v2, row, self.run_id)
         if _VERBOSE or level == "ERROR":
             short = " ".join(f"{k}={v}" for k, v in fields.items()
                              if k in ("owner", "table", "batch", "rows", "seconds", "error"))
@@ -249,7 +276,15 @@ class QueueLogger:
 
 def start_log_listener(queue, parent_logger: RunLoggerBase) -> threading.Thread:
     """Spawn a daemon thread in the parent that drains queue and writes via
-    `parent_logger`. Send `None` to stop. Returns the thread."""
+    `parent_logger`. Send `None` to stop. Returns the thread.
+
+    Handles three message kinds:
+      ``("event", payload)``     — workers' RunLoggerBase.event proxy
+      ``("query_row", payload)`` — workers' QueueQueryRecord.__exit__
+      ``("v2_row", payload)``    — direct v2 row (workers can push these
+                                    when v2 is enabled; payload =
+                                    ``{"table": str, "row": dict}``)
+    """
     system = getattr(parent_logger, "SYSTEM_NAME", "unknown")
 
     def _run():
@@ -257,12 +292,32 @@ def start_log_listener(queue, parent_logger: RunLoggerBase) -> threading.Thread:
             msg = queue.get()
             if msg is None:
                 return
-            kind, payload = msg
+            try:
+                kind, payload = msg
+            except Exception:
+                continue
             if kind == "event":
+                # Mirror to v2 happens inside parent_logger.event() via
+                # the legacy-base hook below.
                 parent_logger.event(**payload)
             elif kind == "query_row":
                 _append_row(parent_logger.QUERIES_CSV, QUERY_FIELDS, payload)
                 _pg_mirror_query(payload, system)
+                v2 = getattr(parent_logger, "_v2", None)
+                if v2 is not None:
+                    _v2_mirror_query(v2, payload, system, parent_logger.run_id)
+            elif kind == "v2_row":
+                v2 = getattr(parent_logger, "_v2", None)
+                if v2 is None:
+                    continue
+                try:
+                    table = payload.get("table")
+                    row = payload.get("row") or {}
+                    if table:
+                        v2.sink.append(table, row)
+                except Exception as e:
+                    print(f"[v2-listener] append failed (silenced): "
+                          f"{type(e).__name__}: {e}", flush=True)
     t = threading.Thread(target=_run, name="log-listener", daemon=True)
     t.start()
     return t

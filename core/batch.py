@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -283,6 +283,7 @@ def _apply_lookup(shaped: pd.DataFrame, df_raw: pd.DataFrame, part: dict, conn, 
 def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
                sql, pk, index, event_dir_str, w_from, w_to, batch_idx,
                env: str = "", adapter=None):
+    started_at = datetime.now(timezone.utc)
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
@@ -308,12 +309,16 @@ def batch_time(conn, logger, *, event, entry_es, mapping, ora_cols, es_cols,
         shaped_ora=shaped_ora, pk=pk,
     )
     return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es),
-            "diff_counts": diff_counts}
+            "diff_counts": diff_counts,
+            "started_at": started_at, "ended_at": datetime.now(timezone.utc),
+            "window_from": w_from, "window_to": w_to,
+            "batch_id": f"{index}#{stamp}"}
 
 
 def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
                    batch_sql, pk, index, event_dir_str, from_id, to_id, batch_idx,
                    env: str = "", adapter=None):
+    started_at = datetime.now(timezone.utc)
     plan = Plan(mapping=mapping, ora_cols=ora_cols, es_cols=es_cols)
     ev_dir = Path(event_dir_str)
     params = {"from_id": from_id, "to_id": to_id}
@@ -340,12 +345,16 @@ def batch_id_range(conn, logger, *, event, entry, mapping, ora_cols, es_cols,
         shaped_ora=shaped_ora, pk=pk,
     )
     return {"batch": batch_idx, "ora_rows": len(df_ora), "es_rows": len(df_es),
-            "diff_counts": diff_counts}
+            "diff_counts": diff_counts,
+            "started_at": started_at, "ended_at": datetime.now(timezone.utc),
+            "id_from": int(from_id), "id_to": int(to_id),
+            "batch_id": f"{index}#{stamp}"}
 
 
 def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
                      allowed, pk, index, event_dir_str, w_from, w_to, batch_idx,
                      env: str = "", adapter=None):
+    started_at = datetime.now(timezone.utc)
     ev_dir = Path(event_dir_str)
     params = {"from_ts": fmt_ts(w_from), "to_ts": fmt_ts(w_to)}
     stamp = w_from.strftime("%Y%m%d_%H%M%S")
@@ -383,4 +392,63 @@ def batch_time_union(conn, logger, *, event, entry_es, parts_prepared,
         shaped_ora=df_ora_shaped, pk=pk,
     )
     return {"batch": batch_idx, "ora_rows": len(df_ora_shaped), "es_rows": len(df_es),
-            "diff_counts": diff_counts}
+            "diff_counts": diff_counts,
+            "started_at": started_at, "ended_at": datetime.now(timezone.utc),
+            "window_from": w_from, "window_to": w_to,
+            "batch_id": f"{index}#{stamp}"}
+
+
+def batch_id_range_union(conn, logger, *, event, entry_es, parts_prepared,
+                         allowed, pk, index, event_dir_str, from_id, to_id,
+                         batch_idx, env: str = "", adapter=None):
+    """One numeric ID window, multiple parts. Each part runs its own @batch SQL
+    with shared :from_id/:to_id, transforms with its mapping, then concatenated
+    and compared against ES via terms-on-PK.
+
+    Empty windows for any single part are silently OK — that part contributes
+    zero rows and the batch continues.
+    """
+    started_at = datetime.now(timezone.utc)
+    ev_dir = Path(event_dir_str)
+    params = {"from_id": from_id, "to_id": to_id}
+    stamp = f"{from_id}_{to_id}"
+    keep_set = set(allowed) | {pk} if allowed else None
+
+    shaped_parts: list[pd.DataFrame] = []
+    total_raw = 0
+    for j, prep in enumerate(parts_prepared, 1):
+        df_raw, _ = run_tracked(conn, prep["batch_sql"], params, logger,
+                                table=f"{event}::part{j}", batch=batch_idx,
+                                env=env, operation="oracle_select")
+        total_raw += len(df_raw)
+        shaped = transform_to_es_shape(df_raw, prep["mapping"], adapter=adapter)
+        if prep.get("raw_part"):
+            shaped = _apply_lookup(shaped, df_raw, prep["raw_part"], conn, logger)
+        shaped_parts.append(shaped)
+
+    df_ora_shaped = pd.concat(shaped_parts, ignore_index=True) if shaped_parts else pd.DataFrame()
+    if keep_set is not None and not df_ora_shaped.empty:
+        df_ora_shaped = df_ora_shaped[[c for c in df_ora_shaped.columns if c in keep_set]]
+    save_oracle_csv(df_ora_shaped, ev_dir / f"{event}_oracle_{stamp}.csv",
+                    event, batch_idx, logger, parts=len(parts_prepared), raw_rows=total_raw)
+
+    ids = df_ora_shaped[pk].tolist() if pk in df_ora_shaped.columns else []
+    with logger.query(f"ES {index} terms {pk} n={len(ids)}", table=index,
+                      batch=batch_idx, env=env, operation="es_search") as q:
+        df_es = fetch_terms_df(index, pk, ids, entry_es)
+        q.set_rows(len(df_es))
+    if keep_set is not None and not df_es.empty:
+        df_es = df_es[[c for c in df_es.columns if c in keep_set or c == pk]]
+    save_es_csv(df_es, ev_dir / f"{event}_es_{stamp}.csv", event, batch_idx, logger)
+
+    fields = list(allowed) if allowed else None
+    diff_counts = save_diffs(
+        compare_shaped(df_ora_shaped, df_es, pk, fields=fields),
+        ev_dir, stamp, event, batch_idx, logger,
+        shaped_ora=df_ora_shaped, pk=pk,
+    )
+    return {"batch": batch_idx, "ora_rows": len(df_ora_shaped), "es_rows": len(df_es),
+            "diff_counts": diff_counts,
+            "started_at": started_at, "ended_at": datetime.now(timezone.utc),
+            "id_from": int(from_id), "id_to": int(to_id),
+            "batch_id": f"{index}#{stamp}"}

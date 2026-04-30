@@ -17,7 +17,7 @@ load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _pipeline_env import DIFF_MODE_ALIASES, TS_FORMATS, normalize_es_env  # noqa: E402
-from core import analytics, duckdb_catalog  # noqa: E402
+from core import duckdb_catalog  # noqa: E402
 from connect_into_postgres import run_summary as _run_summary  # noqa: E402
 from connect_into_postgres import observability as _observability  # noqa: E402
 from apply_changes import pg_tracking as _pg_tracking  # noqa: E402
@@ -414,17 +414,6 @@ def build_changes_summary():
 st.set_page_config(page_title="events editor", layout="wide")
 
 
-PG_SUBPAGES = [
-    "Pipeline Health",
-    "Connection Logs",
-    "Query Performance",
-    "Oracle vs ES Differences",
-    "Missing Records",
-    "Apply Audit",
-    "Raw Tables",
-]
-
-
 def _df_or_warn(pg_conn, conn, sql: str, params=None):
     try:
         return pg_conn.run_query(conn, sql, params)
@@ -451,619 +440,6 @@ def _show_df(df, *, caption: str | None = None, download_name: str | None = None
             mime="text/csv",
             key=f"_dl_{download_name}",
         )
-
-
-def _source_badge(source: str) -> str:
-    label = {"duckdb": "duckdb", "pg": "postgres", "failed": "FAILED"}.get(source, source)
-    return f"source: **{label}**"
-
-
-def _show_df_src(df, source: str, *, caption: str | None = None,
-                 download_name: str | None = None):
-    """_show_df + a small source badge so users can tell DuckDB vs PG."""
-    badge = _source_badge(source)
-    full_caption = f"{badge}" + (f" · {caption}" if caption else "")
-    if df is None:
-        st.warning(f"query failed (source attempted: {source})")
-        return
-    _show_df(df, caption=full_caption, download_name=download_name)
-
-
-def _pg_run_summary(pg_conn, conn):
-    """Phase C: PG holds only this thin per-(run, env, target, op) summary."""
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, run_id, env, target_name, operation,
-               rows_count, source_file,
-               started_at, ended_at,
-               EXTRACT(EPOCH FROM (ended_at - started_at))::numeric(12,3) AS seconds,
-               status, error
-        FROM pipeline_run_summary
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT 200
-    """)
-    _show_df(df, caption=f"{_source_badge('pg')} · pipeline_run_summary "
-                          "— one row per (run, env, target, operation)",
-             download_name="pipeline_run_summary.csv")
-
-
-def _pg_observability(pg_conn, conn):
-    """Phase D observability: connection_log / query_log / batch_log."""
-    badge = _source_badge("pg")
-
-    st.subheader("Connection log (recent 100)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, run_id, env, system_name, target_name, host,
-               started_at, ended_at, duration_ms, status, error
-        FROM connection_log
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT 100
-    """)
-    _show_df(df, caption=f"{badge} · connection_log",
-             download_name="connection_log.csv")
-
-    st.subheader("Slowest queries (top 50)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, run_id, env, batch_id, system_name, target_name,
-               operation, query_hash, duration_ms,
-               rows_returned, rows_affected, status, error,
-               started_at
-        FROM query_log
-        WHERE duration_ms IS NOT NULL
-        ORDER BY duration_ms DESC NULLS LAST
-        LIMIT 50
-    """)
-    _show_df(df, caption=f"{badge} · query_log (slow first)",
-             download_name="query_log_slowest.csv")
-
-    st.subheader("Recent failed queries")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, run_id, env, system_name, target_name, operation,
-               query_hash, duration_ms, error, started_at
-        FROM query_log
-        WHERE status = 'failed' OR error IS NOT NULL
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT 100
-    """)
-    _show_df(df, caption=f"{badge} · query_log (failures)",
-             download_name="query_log_failed.csv")
-
-    st.subheader("Batch throughput per target/operation")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT target_name, operation,
-               COUNT(*)                                AS batches,
-               SUM(rows_returned)                      AS rows_total,
-               AVG(duration_ms)::numeric(12,1)         AS avg_ms,
-               MAX(duration_ms)                        AS max_ms,
-               COUNT(*) FILTER (WHERE status='failed') AS failures,
-               MAX(started_at)                         AS last_seen
-        FROM batch_log
-        GROUP BY target_name, operation
-        ORDER BY batches DESC
-    """)
-    _show_df(df, caption=f"{badge} · batch_log aggregate",
-             download_name="batch_log_aggregate.csv")
-
-    st.subheader("Recent batches (last 100)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, run_id, env, batch_id, target_name, operation,
-               source_system, rows_returned, rows_changed, rows_missing,
-               duration_ms, status, error, started_at
-        FROM batch_log
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT 100
-    """)
-    _show_df(df, caption=f"{badge} · batch_log",
-             download_name="batch_log_recent.csv")
-
-
-def _pg_health(pg_conn, conn):
-    st.subheader("Run summary (per run / env / target / operation)")
-    _pg_run_summary(pg_conn, conn)
-
-    with st.expander("Observability — connection / query / batch logs", expanded=False):
-        _pg_observability(pg_conn, conn)
-
-    st.subheader("Pipeline runs (from logs)")
-    df, src = analytics.run_metrics(pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(df, src, caption="latest 100 runs (derived from log CSVs via DuckDB)",
-                 download_name="pipeline_run_metrics.csv")
-
-    st.subheader("Recent errors")
-    df, src = analytics.recent_errors(pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(df, src, caption="latest 50 ERROR events",
-                 download_name="recent_errors.csv")
-
-
-def _pg_connection_logs(pg_conn, conn):
-    st.subheader("Connection overview")
-    df, src = analytics.connection_overview(pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(df, src, caption="success/fail counts per source",
-                 download_name="connection_overview.csv")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        source = st.selectbox("Source filter",
-                              ["(all)", "oracle", "orcal", "es", "postgres"], index=0)
-    with c2:
-        status = st.selectbox("Status", ["(all)", "success", "failed"], index=0)
-
-    st.subheader("Recent connections")
-    df, src = analytics.connections_recent(
-        source=None if source == "(all)" else source,
-        status=None if status == "(all)" else status,
-        pg_module=pg_conn, pg_conn=conn,
-    )
-    _show_df_src(df, src, caption="recent connections",
-                 download_name="connections.csv")
-
-
-def _pg_query_perf(pg_conn, conn):
-    st.subheader("Slowest 50 queries (any source)")
-    df, src = analytics.query_slowest(pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(df, src, download_name="slowest_queries.csv")
-
-    st.subheader("Best/worst hour for a specific query (sql_hash)")
-    st.caption("Pick one query — same sql_hash means same SQL — to see how its "
-               "latency varies hour-by-hour. Different queries are NOT averaged together.")
-
-    hashes_df, hashes_src = analytics.query_hashes(pg_module=pg_conn, pg_conn=conn)
-    if hashes_df is None or hashes_df.empty:
-        st.info("no query history yet — run the pipeline first")
-        return
-    st.caption(_source_badge(hashes_src) + " · query hashes index")
-
-    def _label(row) -> str:
-        return (f"{row['sql_hash']}  ·  {row['source']}  ·  "
-                f"{row.get('query_table') or '-'}  ·  "
-                f"{row['total_runs']} runs · avg {row['avg_seconds']}s")
-
-    options = [_label(r) for _, r in hashes_df.iterrows()]
-    pick = st.selectbox("Pick sql_hash", options, index=0, key="qhash_pick")
-    picked_hash = pick.split(" ", 1)[0]
-    picked_source = hashes_df[hashes_df["sql_hash"] == picked_hash]["source"].iloc[0]
-
-    meta = hashes_df[(hashes_df["sql_hash"] == picked_hash)
-                     & (hashes_df["source"] == picked_source)].iloc[0]
-    st.caption(f"**SQL preview:** `{meta.get('sql_preview') or '(empty)'}`  ·  "
-               f"first_seen={meta['first_seen']}  ·  last_seen={meta['last_seen']}")
-
-    by_hr, hr_src = analytics.query_by_hour(picked_hash, source=picked_source,
-                                            pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(by_hr, hr_src,
-                 caption=f"hour-by-hour timing for sql_hash={picked_hash}",
-                 download_name=f"query_by_hour_{picked_hash}.csv")
-
-    if by_hr is not None and not by_hr.empty:
-        try:
-            chart_df = by_hr.set_index("hour_of_day")[["avg_seconds", "max_seconds"]]
-            st.line_chart(chart_df)
-        except Exception as e:
-            st.caption(f"chart unavailable: {e}")
-        try:
-            best = by_hr.loc[by_hr["avg_seconds"].idxmin()]
-            worst = by_hr.loc[by_hr["avg_seconds"].idxmax()]
-            st.success(f"best hour: **{int(best['hour_of_day'])}:00** "
-                       f"(avg {best['avg_seconds']}s over {int(best['runs'])} runs)")
-            st.warning(f"worst hour: **{int(worst['hour_of_day'])}:00** "
-                       f"(avg {worst['avg_seconds']}s over {int(worst['runs'])} runs)")
-        except Exception:
-            pass
-
-    with st.expander("All query hashes (full list)"):
-        _show_df(hashes_df, download_name="query_hashes.csv")
-
-    st.subheader("All queries (slow flagged)")
-    only_slow = st.checkbox("only slow_query=true", value=False)
-    src_pick = st.selectbox("source", ["(all)", "oracle", "orcal", "es", "postgres"],
-                            index=0, key="qperf_src")
-    df, src = analytics.query_perf(
-        only_slow=only_slow,
-        source=None if src_pick == "(all)" else src_pick,
-        pg_module=pg_conn, pg_conn=conn,
-    )
-    _show_df_src(df, src, download_name="queries.csv")
-
-
-def _pg_diffs(pg_conn, conn):
-    st.subheader("Data quality (per event/env/field)")
-    df, src = analytics.data_quality(pg_module=pg_conn, pg_conn=conn)
-    _show_df_src(df, src, caption="aggregate diff/missing counts per field",
-                 download_name="data_quality.csv")
-
-    st.subheader("Field-level diffs")
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        ev_df, _ = analytics.changes_distinct_events(pg_module=pg_conn, pg_conn=conn)
-        events_list = ev_df["event"].tolist() if (ev_df is not None and not ev_df.empty) else []
-        ev = st.selectbox("event", ["(all)"] + events_list, key="diff_ev")
-    with c2:
-        en = st.selectbox("env", ["(all)", "stage", "prod"], key="diff_env")
-    with c3:
-        st_ = st.selectbox("status", ["(all)", "diff", "applied",
-                                       "missing_in_es", "missing_in_oracle"], key="diff_st")
-    df, src = analytics.changes_browse(
-        event=None if ev == "(all)" else ev,
-        env=None if en == "(all)" else en,
-        status=None if st_ == "(all)" else st_,
-        pg_module=pg_conn, pg_conn=conn,
-    )
-    _show_df_src(df, src, download_name="diffs.csv")
-
-
-def _pg_missing(pg_conn, conn):
-    st.subheader("Missing records (Oracle has it, ES doesn't)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT event, env,
-               COUNT(*)                                            AS total,
-               COUNT(*) FILTER (WHERE applied_ts IS NOT NULL)      AS applied,
-               COUNT(*) FILTER (WHERE applied_ts IS NULL)          AS pending
-        FROM pipeline_missing
-        GROUP BY event, env
-        ORDER BY pending DESC, event, env
-    """)
-    _show_df(df, caption="counts per event/env", download_name="missing_summary.csv")
-
-    st.subheader("Browse missing rows")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        ev = st.text_input("event filter (exact)", "", key="mis_ev")
-    with c2:
-        en = st.selectbox("env", ["(all)", "stage", "prod"], key="mis_env")
-    df, src = analytics.missing_browse(
-        event=ev.strip() or None,
-        env=None if en == "(all)" else en,
-        pg_module=pg_conn, pg_conn=conn,
-    )
-    _show_df_src(df, src, download_name="missing_rows.csv")
-
-
-def _pg_apply_audit(pg_conn, conn):
-    st.subheader("Apply batches (which CSVs already pushed to ES)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT event, env, mode, source_file, applied_ts, run_id,
-               docs_planned, es_updated, es_created, es_conflicts, es_failures
-        FROM pipeline_apply_batches
-        ORDER BY applied_ts DESC LIMIT 500
-    """)
-    _show_df(df, download_name="apply_batches.csv")
-
-    st.subheader("Audit log (raw events)")
-    df = _df_or_warn(pg_conn, conn, """
-        SELECT id, sync_ts, event, env, record_type, doc_id, batch, line_no, raw
-        FROM pipeline_apply_audit
-        ORDER BY id DESC LIMIT 500
-    """)
-    _show_df(df, download_name="apply_audit.csv")
-
-
-def _pg_raw_tables(pg_conn, conn):
-    """Original raw table browser — listing all tables with row counts + delete."""
-    try:
-        tables_df = pg_conn.list_tables(conn)
-    except Exception as e:
-        st.error(f"list_tables failed: {e}")
-        return
-    if tables_df.empty:
-        st.info("No tables yet — run the pipeline first.")
-        return
-
-    all_tables = tables_df["table_name"].tolist()
-
-    # Active tables (Phase D / loop 6) — what the pipeline actually uses today.
-    ACTIVE_TABLES = [
-        "pipeline_run_summary",     # one row per (run, env, target, operation)
-        "connection_log",           # observability: per-connection timing
-        "query_log",                # observability: per-query timing + counts
-        "batch_log",                # observability: per-batch timing + counts
-        "pipeline_apply_batches",   # apply state: which CSVs already in ES
-    ]
-    LEGACY_TABLES = {
-        "pipeline_changes", "pipeline_missing", "pipeline_apply_audit",
-        "pipeline_summary",
-        "pipeline_log_connection", "pipeline_log_event",
-        "pipeline_log_query", "pipeline_log_offsets",
-        "file_registry", "ingest_log",
-    }
-
-    show_legacy = st.checkbox(
-        "Show legacy tables too",
-        value=False,
-        help="Active set: pipeline_run_summary + connection_log + query_log + "
-             "batch_log + pipeline_apply_batches. Everything else is legacy "
-             "(read-only after Phase C; will be removed by drop_legacy_tables.py).",
-    )
-
-    if show_legacy:
-        tables = all_tables[:]
-    else:
-        tables = [t for t in ACTIVE_TABLES if t in all_tables]
-        hidden = [t for t in all_tables
-                  if t not in ACTIVE_TABLES and t in LEGACY_TABLES]
-        other  = [t for t in all_tables
-                  if t not in ACTIVE_TABLES and t not in LEGACY_TABLES]
-        if hidden:
-            st.caption(f"Hiding {len(hidden)} legacy table(s): "
-                       + ", ".join(f"`{t}`" for t in sorted(hidden)))
-        if other:
-            st.caption(f"Hiding {len(other)} other table(s) "
-                       "(not part of the active or legacy set): "
-                       + ", ".join(f"`{t}`" for t in sorted(other)))
-
-    if not tables:
-        st.info("No matching tables. Toggle 'Show legacy tables too' to see "
-                "the full list, or run the pipeline first.")
-        return
-
-    def _sort_key(name: str) -> tuple:
-        if name in ACTIVE_TABLES:
-            return (0, ACTIVE_TABLES.index(name))
-        if name in LEGACY_TABLES:
-            return (1, name)
-        return (2, name)
-    tables.sort(key=_sort_key)
-
-    @st.cache_data(ttl=15, show_spinner=False)
-    def _row_counts(tbls: tuple[str, ...]) -> dict[str, int | None]:
-        out: dict[str, int | None] = {}
-        for t in tbls:
-            try:
-                df = pg_conn.run_query(conn, f"SELECT COUNT(*) AS n FROM {t}")
-                out[t] = int(df.iloc[0, 0])
-            except Exception:
-                out[t] = None
-        return out
-    counts = _row_counts(tuple(tables))
-
-    def _fmt(t: str) -> str:
-        n = counts.get(t)
-        return f"{t}  ({n:,} rows)" if isinstance(n, int) else f"{t}  (count: ?)"
-
-    sel = st.selectbox("Table", tables, index=0, format_func=_fmt)
-
-    confirm_key = f"_pg_truncate_confirm_{sel}"
-    dc1, dc2, dc3 = st.columns([1, 1, 4])
-    with dc1:
-        if st.button("🗑 Delete all rows", key=f"_pg_truncate_btn_{sel}"):
-            st.session_state[confirm_key] = True
-    if st.session_state.get(confirm_key):
-        with dc2:
-            if st.button(f"Confirm TRUNCATE `{sel}`",
-                         key=f"_pg_truncate_yes_{sel}", type="primary"):
-                try:
-                    pg_conn.execute(conn, f"TRUNCATE TABLE {sel} RESTART IDENTITY")
-                    st.success(f"truncated `{sel}` (schema kept)")
-                    st.session_state[confirm_key] = False
-                    _row_counts.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"truncate failed: {type(e).__name__}: {e}")
-        with dc3:
-            if st.button("Cancel", key=f"_pg_truncate_no_{sel}"):
-                st.session_state[confirm_key] = False
-                st.rerun()
-        st.warning(f"This will permanently delete **all rows** in `{sel}`. "
-                   f"Schema stays. Identity (id) restarts at 1.")
-
-    # Probe columns + types now (used by Delete-keep-these and Delete-WHERE).
-    try:
-        cols_meta_df = pg_conn.run_query(conn, """
-            SELECT column_name, data_type FROM information_schema.columns
-            WHERE table_schema = current_schema() AND table_name = %s
-            ORDER BY ordinal_position
-        """, (sel,))
-        col_types: dict[str, str] = dict(
-            zip(cols_meta_df["column_name"], cols_meta_df["data_type"])
-        )
-    except Exception as e:
-        st.warning(f"could not read columns: {e}")
-        col_types = {}
-    cols = list(col_types.keys())
-
-    _NUMERIC_TYPES = {"smallint", "integer", "bigint", "numeric",
-                      "real", "double precision"}
-
-    def _is_string_col(t: str) -> bool:
-        return t not in _NUMERIC_TYPES and not t.startswith("timestamp") \
-               and not t.startswith("date") and t != "boolean"
-
-    # ---- Delete all EXCEPT these IDs (keep-list) ----
-    with st.expander(f"⚠️ Delete all EXCEPT (keep specific rows in `{sel}`)"):
-        st.caption("Pick a column, paste the value(s) to **keep**. "
-                   "Everything else in the table gets deleted.")
-        if not cols:
-            st.warning("no columns probed — cannot show this control.")
-        else:
-            default_col = "doc_id" if "doc_id" in cols else \
-                          ("id" if "id" in cols else cols[0])
-            kc1, kc2 = st.columns([1, 3])
-            with kc1:
-                keep_col = st.selectbox("Match column", cols,
-                                        index=cols.index(default_col),
-                                        key=f"_pg_keepcol_{sel}")
-            with kc2:
-                keep_vals_raw = st.text_input(
-                    f"Value(s) to keep (comma-separated, no quotes needed)",
-                    value="", key=f"_pg_keepvals_{sel}",
-                    help="e.g. `2493840_3` or `5, 7, 12`. "
-                         "String values auto-quoted based on column type.",
-                )
-
-            keep_vals = [v.strip() for v in keep_vals_raw.split(",") if v.strip()]
-            ctype = col_types.get(keep_col, "text")
-            quote = _is_string_col(ctype)
-
-            def _quote(v: str) -> str:
-                return "'" + v.replace("'", "''") + "'" if quote else v
-
-            if keep_vals:
-                in_list = ", ".join(_quote(v) for v in keep_vals)
-                cond = f"{keep_col} NOT IN ({in_list})"
-                st.code(f"DELETE FROM {sel} WHERE {cond}", language="sql")
-
-                kp_a, kp_b, kp_c = st.columns([1, 1, 4])
-                with kp_a:
-                    if st.button("Preview count", key=f"_pg_keepprev_{sel}"):
-                        try:
-                            df_n = pg_conn.run_query(
-                                conn, f"SELECT COUNT(*) AS n FROM {sel} WHERE {cond}")
-                            st.session_state[f"_pg_keepcnt_{sel}"] = int(df_n.iloc[0, 0])
-                            st.session_state[f"_pg_keepcond_{sel}"] = cond
-                        except Exception as e:
-                            st.error(f"preview failed: {type(e).__name__}: {e}")
-                            st.session_state.pop(f"_pg_keepcnt_{sel}", None)
-
-                prev_n = st.session_state.get(f"_pg_keepcnt_{sel}")
-                prev_cond = st.session_state.get(f"_pg_keepcond_{sel}")
-                if isinstance(prev_n, int) and prev_cond == cond:
-                    with kp_b:
-                        st.metric("rows that will be deleted", f"{prev_n:,}")
-                    with kp_c:
-                        if prev_n == 0:
-                            st.info("Nothing to delete — kept value(s) cover everything.")
-                        else:
-                            confirm_text = st.text_input(
-                                f"Type **DELETE {prev_n}** to confirm",
-                                value="", key=f"_pg_keepconfirm_{sel}",
-                            )
-                            if confirm_text == f"DELETE {prev_n}":
-                                if st.button("🗑 Execute DELETE",
-                                             type="primary",
-                                             key=f"_pg_keepgo_{sel}"):
-                                    try:
-                                        deleted = pg_conn.execute(
-                                            conn, f"DELETE FROM {sel} WHERE {cond}")
-                                        st.success(f"deleted {deleted} row(s) "
-                                                   f"from `{sel}` (kept "
-                                                   f"{len(keep_vals)} row(s))")
-                                        st.session_state.pop(
-                                            f"_pg_keepcnt_{sel}", None)
-                                        st.session_state.pop(
-                                            f"_pg_keepcond_{sel}", None)
-                                        _row_counts.clear()
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"delete failed: "
-                                                 f"{type(e).__name__}: {e}")
-
-    # ---- Delete WHERE (partial delete with custom condition) ----
-    with st.expander(f"⚠️ Delete WHERE (partial delete on `{sel}`)"):
-        st.caption("Examples:  `id <> 3433423`  ·  `event = 'PLAYERBONUS'`  ·  "
-                   "`applied_ts IS NULL`  ·  `sync_ts < now() - interval '7 days'`")
-        del_where = st.text_input("WHERE condition (required, no semicolons)",
-                                  value="", key=f"_pg_delwhere_{sel}")
-        BAD_TOKENS = (";", "--", "/*", "drop ", "alter ", "truncate ",
-                      "insert ", "update ", "create ", "grant ", "revoke ")
-        cond = del_where.strip()
-        invalid_reason: str | None = None
-        if not cond:
-            invalid_reason = "empty WHERE — refusing (use TRUNCATE button above for full wipe)"
-        else:
-            low = cond.lower()
-            for tok in BAD_TOKENS:
-                if tok in low:
-                    invalid_reason = f"contains forbidden token `{tok.strip()}`"
-                    break
-
-        col_a, col_b, col_c = st.columns([1, 1, 4])
-        with col_a:
-            if st.button("Preview count", key=f"_pg_delprev_{sel}",
-                         disabled=invalid_reason is not None):
-                try:
-                    df_n = pg_conn.run_query(
-                        conn, f"SELECT COUNT(*) AS n FROM {sel} WHERE {cond}")
-                    n = int(df_n.iloc[0, 0])
-                    st.session_state[f"_pg_delcnt_{sel}"] = n
-                    st.session_state[f"_pg_delcond_{sel}"] = cond
-                except Exception as e:
-                    st.error(f"preview failed: {type(e).__name__}: {e}")
-                    st.session_state.pop(f"_pg_delcnt_{sel}", None)
-
-        if invalid_reason and cond:
-            st.error(f"Refused: {invalid_reason}")
-
-        prev_n = st.session_state.get(f"_pg_delcnt_{sel}")
-        prev_cond = st.session_state.get(f"_pg_delcond_{sel}")
-        if isinstance(prev_n, int) and prev_cond == cond and not invalid_reason:
-            with col_b:
-                st.metric("rows matched", f"{prev_n:,}")
-            with col_c:
-                if prev_n == 0:
-                    st.info("Nothing to delete — no rows match.")
-                else:
-                    confirm_text = st.text_input(
-                        f"Type **DELETE {prev_n}** to confirm",
-                        value="", key=f"_pg_delconfirm_{sel}",
-                    )
-                    if confirm_text == f"DELETE {prev_n}":
-                        if st.button("🗑 Execute DELETE", type="primary",
-                                     key=f"_pg_delgo_{sel}"):
-                            try:
-                                deleted = pg_conn.execute(
-                                    conn, f"DELETE FROM {sel} WHERE {cond}")
-                                st.success(f"deleted {deleted} row(s) from `{sel}`")
-                                st.session_state.pop(f"_pg_delcnt_{sel}", None)
-                                st.session_state.pop(f"_pg_delcond_{sel}", None)
-                                _row_counts.clear()
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"delete failed: {type(e).__name__}: {e}")
-
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-    with c1:
-        limit = st.number_input("Limit", min_value=1, max_value=100000, value=1000, step=100)
-    with c2:
-        offset_v = st.number_input("Offset", min_value=0, value=0, step=100)
-    with c3:
-        newest_first = st.checkbox("Newest first", value=True,
-                                   help="ORDER BY id DESC if the table has an `id` column.")
-    with c4:
-        where_clause = st.text_input("WHERE (optional)", value="",
-                                     help="Raw SQL fragment, e.g. `event = 'PLAYERBONUS'`. Read-only.")
-
-    has_id = "id" in cols
-    order_clause = "ORDER BY id DESC" if (newest_first and has_id) else ""
-
-    where_sql = ""
-    if where_clause.strip():
-        if any(tok in where_clause.lower()
-               for tok in (";", "drop ", "delete ", "update ", "insert ", "alter ", "truncate ")):
-            st.error("WHERE rejected: contains a write/DDL keyword.")
-            return
-        where_sql = f"WHERE {where_clause}"
-
-    try:
-        cnt_df = pg_conn.run_query(conn, f"SELECT COUNT(*) AS n FROM {sel} {where_sql}")
-        total = int(cnt_df.iloc[0, 0])
-        st.caption(f"`{sel}` total rows{' (filtered)' if where_sql else ''}: "
-                   f"**{total:,}**  ·  cols: {len(cols)}")
-    except Exception as e:
-        st.warning(f"count failed: {e}")
-        total = None
-
-    sql = (f"SELECT * FROM {sel} {where_sql} {order_clause} "
-           f"LIMIT {int(limit)} OFFSET {int(offset_v)}")
-    try:
-        df = pg_conn.run_query(conn, sql)
-    except Exception as e:
-        st.error(f"query failed: {e}")
-        st.code(sql, language="sql")
-        return
-
-    _show_df(df, caption=f"showing {len(df)} rows  ·  `{sql}`",
-             download_name=f"{sel}.csv")
-    if total is not None and offset_v + len(df) < total:
-        st.caption("more rows available — increase Limit or use Offset to page through.")
-
-
-_PG_RENDERERS = {
-    "Pipeline Health": _pg_health,
-    "Connection Logs": _pg_connection_logs,
-    "Query Performance": _pg_query_perf,
-    "Oracle vs ES Differences": _pg_diffs,
-    "Missing Records": _pg_missing,
-    "Apply Audit": _pg_apply_audit,
-    "Raw Tables": _pg_raw_tables,
-}
 
 
 def _index_to_event_map() -> dict[str, list[str]]:
@@ -1175,16 +551,33 @@ def render_apply_page():
             _render_events(log_box, last.get("events") or [])
 
 
+_PG_LIMIT_OPTIONS = [100, 500, 1000]
+
+
+def _pg_table_tab(pg_conn, conn, *, title: str, description: str, sql: str,
+                  limit_key: str, download_name: str) -> None:
+    """One tab: header + Limit selector + dataframe + CSV download."""
+    st.subheader(title)
+    st.caption(description)
+    limit = st.selectbox("Limit", _PG_LIMIT_OPTIONS, index=0, key=limit_key)
+    df = _df_or_warn(pg_conn, conn, f"{sql}\nLIMIT {int(limit)}")
+    _show_df(df, download_name=download_name)
+
+
 def render_postgres_page():
-    """Postgres dashboards (read-only). 7 sub-pages selectable from sidebar."""
-    st.title("Postgres viewer")
+    """Postgres logging tables viewer (read-only).
+
+    Shows the four tables the pipeline writes for run / observability tracking.
+    Newest rows first; pick a Limit and download as CSV.
+    """
+    st.title("Postgres logging tables")
 
     host = os.getenv("PG_HOST"); port = os.getenv("PG_PORT", "5432")
     db = os.getenv("PG_DB"); schema = os.getenv("PG_SCHEMA", "public")
     if not (host and db):
         st.error("PG_HOST / PG_DB not set in .env")
         return
-    st.caption(f"`{host}:{port}/{db}` schema=`{schema}`")
+    st.caption(f"`{host}:{port}/{db}` schema=`{schema}`  ·  read-only viewer")
 
     try:
         from connect_into_postgres import connect_to_postgres as pg_conn
@@ -1192,15 +585,10 @@ def render_postgres_page():
         st.error(f"failed to import postgres connector: {type(e).__name__}: {e}")
         return
 
-    rb1, rb2 = st.columns([1, 4])
-    with rb1:
-        if st.button("↻ Refresh data from Postgres",
-                     help="Re-read from PG. Read-only — does not run pipeline or sync."):
-            st.cache_resource.clear()
-            st.cache_data.clear()
-            st.rerun()
-    with rb2:
-        st.caption("Read-only viewer. Pipeline (`main.py` / `apply_changes`) writes to Postgres.")
+    if st.button("↻ Refresh", help="Re-read from PG. Read-only."):
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        st.rerun()
 
     @st.cache_resource(show_spinner="connecting to postgres…")
     def _conn():
@@ -1211,9 +599,80 @@ def render_postgres_page():
         st.error(f"connect failed: {type(e).__name__}: {e}")
         return
 
-    sub = st.sidebar.radio("Postgres section", PG_SUBPAGES, index=0, key="pg_subpage")
-    st.markdown(f"### {sub}")
-    _PG_RENDERERS[sub](pg_conn, conn)
+    tab_run, tab_conn, tab_query, tab_batch = st.tabs([
+        "pipeline_run_summary",
+        "connection_log",
+        "query_log",
+        "batch_log",
+    ])
+
+    with tab_run:
+        _pg_table_tab(
+            pg_conn, conn,
+            title="pipeline_run_summary",
+            description="One row per (run_id × env × target × operation). "
+                        "Source of truth for run history.",
+            sql="""
+                SELECT id, run_id, env, target_name, operation,
+                       rows_count, source_file,
+                       started_at, ended_at,
+                       EXTRACT(EPOCH FROM (ended_at - started_at))::numeric(12,3) AS seconds,
+                       status, error
+                FROM pipeline_run_summary
+                ORDER BY started_at DESC NULLS LAST
+            """,
+            limit_key="pg_lim_run_summary",
+            download_name="pipeline_run_summary.csv",
+        )
+
+    with tab_conn:
+        _pg_table_tab(
+            pg_conn, conn,
+            title="connection_log",
+            description="One row per connection attempt to Oracle / Elasticsearch / Postgres.",
+            sql="""
+                SELECT id, run_id, env, system_name, target_name, host,
+                       started_at, ended_at, duration_ms, status, error
+                FROM connection_log
+                ORDER BY started_at DESC NULLS LAST
+            """,
+            limit_key="pg_lim_connection_log",
+            download_name="connection_log.csv",
+        )
+
+    with tab_query:
+        _pg_table_tab(
+            pg_conn, conn,
+            title="query_log",
+            description="One row per Oracle SQL / ES request / PG query. "
+                        "`duration_ms` is in milliseconds.",
+            sql="""
+                SELECT id, run_id, env, batch_id, system_name, target_name,
+                       operation, query_hash, duration_ms,
+                       rows_returned, rows_affected, status, error,
+                       started_at
+                FROM query_log
+                ORDER BY started_at DESC NULLS LAST
+            """,
+            limit_key="pg_lim_query_log",
+            download_name="query_log.csv",
+        )
+
+    with tab_batch:
+        _pg_table_tab(
+            pg_conn, conn,
+            title="batch_log",
+            description="One row per pipeline batch (compare / apply_changes / apply_missing).",
+            sql="""
+                SELECT id, run_id, env, batch_id, target_name, operation,
+                       source_system, rows_returned, rows_changed, rows_missing,
+                       duration_ms, status, error, started_at
+                FROM batch_log
+                ORDER BY started_at DESC NULLS LAST
+            """,
+            limit_key="pg_lim_batch_log",
+            download_name="batch_log.csv",
+        )
 
 
 PAGE = st.sidebar.radio("Page", ["Pipeline", "Apply", "Postgres"], index=0, key="page_selector")
@@ -1339,6 +798,32 @@ if st.sidebar.button("Reload from disk"):
 entry = resolve_entry(cfg[sel])
 st.subheader(sel)
 
+mode = (entry.get("MODE") or "time").strip().lower()
+mode_color = {
+    "time": "blue", "id_range": "violet",
+    "time_union": "green", "id_range_union": "orange",
+}.get(mode, "grey")
+mc1, mc2, mc3 = st.columns([1, 1, 2])
+with mc1:
+    st.markdown(f"**MODE:** :{mode_color}[{mode}]")
+with mc2:
+    st.markdown(f"**INDEX_NAME:** `{entry.get('INDEX_NAME', '?')}`")
+with mc3:
+    if mode == "id_range":
+        st.markdown(
+            f"**PK:** `{entry.get('PK', '?')}` &nbsp;·&nbsp; "
+            f"**ID_COLUMN:** `{entry.get('ID_COLUMN', '?')}`"
+        )
+    elif mode == "id_range_union":
+        parts_n = len(entry.get("parts") or [])
+        ids = " · ".join(p.get("ID_COLUMN", "?") for p in (entry.get("parts") or []))
+        st.markdown(
+            f"**PK:** `{entry.get('PK', '?')}` &nbsp;·&nbsp; "
+            f"**parts:** {parts_n} &nbsp;·&nbsp; **id cols:** `{ids}`"
+        )
+    elif mode == "time_union":
+        st.markdown(f"**parts:** {len(entry.get('parts') or [])}")
+
 is_running = st.toggle("IS_RUNNING", value=bool(entry.get("IS_RUNNING", False)),
                        key=f"run_{sel}")
 
@@ -1361,12 +846,177 @@ if has_limit:
 cur_banch = entry.get("BANCH_VALUE")
 new_banch = None
 if cur_banch is not None:
+    if mode in ("id_range", "id_range_union"):
+        banch_help = "Chunk size in IDs (int). 5000 = 5000-id windows."
+    else:
+        banch_help = "Window size: 'HOUR'/'DAY'/'WEEK', '30 DAYS', '3 HOURS', '15m'."
     new_banch = st.text_input(
         "BANCH_VALUE",
         value=str(cur_banch),
         key=f"banch_{sel}",
-        help="Window size: 'HOUR'/'DAY'/'WEEK', '30 DAYS', '3 HOURS', '15m', or int (id_range chunk size).",
+        help=banch_help,
     )
+
+# ---------------------------------------------------------------------------
+# Batch range selector (id_range / id_range_union only)
+# ---------------------------------------------------------------------------
+
+new_batch_from = entry.get("BATCH_FROM_ID")
+new_batch_to = entry.get("BATCH_TO_ID")
+clear_batch_overrides = False
+range_dirty = False  # any change to from/to during this render
+
+if mode in ("id_range", "id_range_union"):
+    st.markdown("**Batch range** — pick a window or batch index range; default runs everything")
+
+    range_key = f"range_{sel}"
+    if range_key not in st.session_state:
+        st.session_state[range_key] = {"global_min": None, "global_max": None,
+                                       "per_part": []}
+
+    rc1, rc2 = st.columns([1, 4])
+    with rc1:
+        if st.button("Compute range from Oracle", key=f"probe_{sel}"):
+            try:
+                from connect_into_orcal.connect_to_orcal import create_connection
+                from core.batch import parse_sql_sections as _parse_sections
+
+                if mode == "id_range_union":
+                    parts_for_probe = entry.get("parts") or []
+                    sql_paths = [(p.get("ID_COLUMN", "?"),
+                                  SETTINGS_DIR / p["sql_file"]) for p in parts_for_probe]
+                else:
+                    sql_paths = [(entry.get("ID_COLUMN", "?"),
+                                  SETTINGS_DIR / entry["sql_file"])]
+                mins, maxs, per_part = [], [], []
+                with st.spinner("Probing Oracle..."):
+                    with create_connection() as _conn:
+                        with _conn.cursor() as _cur:
+                            for id_col, p in sql_paths:
+                                sections = _parse_sections(p.read_text(encoding="utf-8"))
+                                if "range" not in sections:
+                                    per_part.append((id_col, None, None))
+                                    continue
+                                _cur.execute(sections["range"])
+                                row = _cur.fetchone()
+                                if row and row[0] is not None and row[1] is not None:
+                                    mn, mx = int(row[0]), int(row[1])
+                                    mins.append(mn); maxs.append(mx)
+                                    per_part.append((id_col, mn, mx))
+                                else:
+                                    per_part.append((id_col, None, None))
+                st.session_state[range_key] = {
+                    "global_min": min(mins) if mins else None,
+                    "global_max": max(maxs) if maxs else None,
+                    "per_part": per_part,
+                }
+                st.success("Range probed.")
+            except Exception as _e:
+                st.error(f"Probe failed: {type(_e).__name__}: {_e}")
+
+    rng = st.session_state.get(range_key, {})
+    g_min = rng.get("global_min")
+    g_max = rng.get("global_max")
+    try:
+        step_int = int(new_banch) if new_banch is not None else int(cur_banch or 0)
+    except (ValueError, TypeError):
+        step_int = 0
+    total_global = ((g_max - g_min + step_int - 1) // step_int) if (g_min is not None and g_max is not None and step_int > 0) else None
+
+    with rc2:
+        if g_min is None:
+            st.caption("Range not yet probed.")
+        else:
+            for id_col, mn, mx in rng.get("per_part", []):
+                st.caption(
+                    f"`{id_col}`: min={mn} max={mx}"
+                    if mn is not None else f"`{id_col}`: empty"
+                )
+            st.markdown(
+                f"**globalMin:** `{g_min}` &nbsp;·&nbsp; "
+                f"**globalMax:** `{g_max}` &nbsp;·&nbsp; "
+                f"**total batches @ step={step_int}:** `{total_global}`"
+            )
+
+    # Determine current selection mode from saved entry.
+    if entry.get("BATCH_FROM_ID") is not None or entry.get("BATCH_TO_ID") is not None:
+        default_mode = "Window"
+    else:
+        default_mode = "All"
+    sel_mode_key = f"selmode_{sel}"
+    if sel_mode_key not in st.session_state:
+        st.session_state[sel_mode_key] = default_mode
+
+    sel_mode = st.radio(
+        "Run scope",
+        ["All", "Window", "Batch index range"],
+        index=["All", "Window", "Batch index range"].index(st.session_state[sel_mode_key]),
+        horizontal=True,
+        key=f"selmoderadio_{sel}",
+    )
+    st.session_state[sel_mode_key] = sel_mode
+
+    if sel_mode == "All":
+        # Mark that any prior overrides should be removed on Save.
+        if entry.get("BATCH_FROM_ID") is not None or entry.get("BATCH_TO_ID") is not None:
+            st.caption("On Save, BATCH_FROM_ID / BATCH_TO_ID will be cleared.")
+            clear_batch_overrides = True
+        new_batch_from = None
+        new_batch_to = None
+    elif sel_mode == "Window":
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            new_batch_from = st.number_input(
+                "BATCH_FROM_ID",
+                value=int(entry.get("BATCH_FROM_ID") if entry.get("BATCH_FROM_ID") is not None
+                          else (g_min if g_min is not None else 0)),
+                step=step_int or 1, key=f"bfrom_{sel}",
+                help="Inclusive lower bound for the iteration window.",
+            )
+        with wc2:
+            new_batch_to = st.number_input(
+                "BATCH_TO_ID",
+                value=int(entry.get("BATCH_TO_ID") if entry.get("BATCH_TO_ID") is not None
+                          else (g_max if g_max is not None else 1)),
+                step=step_int or 1, key=f"bto_{sel}",
+                help="Exclusive upper bound for the iteration window.",
+            )
+        if new_batch_to <= new_batch_from:
+            st.error("BATCH_TO_ID must be > BATCH_FROM_ID")
+        else:
+            n_batches = ((int(new_batch_to) - int(new_batch_from) + step_int - 1) // step_int) if step_int > 0 else 0
+            st.caption(f"Selected window covers ~`{n_batches}` batch(es) at step={step_int}.")
+        range_dirty = True
+    else:  # Batch index range
+        if g_min is None or step_int <= 0:
+            st.warning("Click 'Compute range from Oracle' first to enable batch-index selection.")
+            new_batch_from = entry.get("BATCH_FROM_ID")
+            new_batch_to = entry.get("BATCH_TO_ID")
+        else:
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                bi_from = st.number_input(
+                    "Batch index from (1-based)",
+                    value=1, min_value=1, max_value=int(total_global or 1),
+                    step=1, key=f"bifrom_{sel}",
+                )
+            with bc2:
+                bi_to = st.number_input(
+                    "Batch index to (1-based, inclusive)",
+                    value=int(total_global or 1), min_value=1, max_value=int(total_global or 1),
+                    step=1, key=f"bito_{sel}",
+                )
+            if bi_to < bi_from:
+                st.error("'to' must be >= 'from'")
+            else:
+                new_batch_from = int(g_min) + (int(bi_from) - 1) * step_int
+                new_batch_to = min(int(g_min) + int(bi_to) * step_int, int(g_max))
+                st.caption(
+                    f"Translates to BATCH_FROM_ID=`{new_batch_from}`, BATCH_TO_ID=`{new_batch_to}` "
+                    f"(`{int(bi_to) - int(bi_from) + 1}` batch(es))"
+                )
+        range_dirty = True
+
 
 has_times = "START_TIME" in entry or "END_TIME" in entry
 new_start = new_end = None
@@ -1398,7 +1048,7 @@ if parts:
             if f not in seen:
                 seen.add(f); csv_fields.append(f)
 else:
-    csv_path_rel = f"mappings/{sel}.csv"
+    csv_path_rel = entry.get("VALUE_COLM") or f"mappings/{sel}.csv"
     csv_fields = load_csv_fields(csv_path_rel)
 current = parse_selected(entry.get("FILED_THAT_RUN", ""))
 
@@ -1446,6 +1096,14 @@ if st.button("Save to YAML", type="primary"):
     cfg[sel]["IS_RUNNING"] = bool(is_running)
     cfg[sel]["ES_ENV"] = es_env
     cfg[sel]["FILED_THAT_RUN"] = ",".join(ordered)
+    # Batch range overrides (id_range / id_range_union)
+    if mode in ("id_range", "id_range_union"):
+        if clear_batch_overrides:
+            cfg[sel].pop("BATCH_FROM_ID", None)
+            cfg[sel].pop("BATCH_TO_ID", None)
+        elif range_dirty and new_batch_from is not None and new_batch_to is not None:
+            cfg[sel]["BATCH_FROM_ID"] = int(new_batch_from)
+            cfg[sel]["BATCH_TO_ID"] = int(new_batch_to)
     if has_times and new_start is not None and new_end is not None:
         cfg[sel]["START_TIME"] = new_start.strftime("%Y-%m-%d %H:%M:%S")
         cfg[sel]["END_TIME"]   = new_end.strftime("%Y-%m-%d %H:%M:%S")

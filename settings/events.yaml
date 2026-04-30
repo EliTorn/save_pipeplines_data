@@ -1,4 +1,4 @@
-PIPELINE_DIFF_MODE: changes
+PIPELINE_DIFF_MODE: both
 LOGING_LOGOUT:
   IS_RUNNING: false
   index_config: indexes/loginlogoutinfo/config.yaml
@@ -8,15 +8,15 @@ LOGING_LOGOUT:
 CARDUSERS:
   IS_RUNNING: false
   index_config: indexes/cardusers/config.yaml
-  START_TIME: '2026-04-01 00:00:00'
-  END_TIME: '2026-04-02 00:00:00'
   FILED_THAT_RUN: id,cardId,creationDate,lastFourDigits,expiryDate,isWhitelisted,isBlacklisted,isVerified,companyName,paymentMode,bin,externalUserIds,userIds,paymentSystem
 PLAYERBONUS:
   IS_RUNNING: true
   index_config: indexes/playerbonus/config.yaml
-  START_TIME: '2026-04-01 00:00:00'
-  END_TIME: '2026-04-02 00:00:00'
-  FILED_THAT_RUN: id,userBonusId,userId,externalUserId,skinId,skin,skinGroup,skinOrigin,parentId,externalParentId,skinOriginId,skinGroupId,currency,internalAccount,statusId,status,bonusType,createdDate,expirationDate,expirationDays,bonusName,activeDays,amount,amountLeft,points,promoCode,description,freeSpinAmount,freeSpinsLeft,chipCountLeft,amountWon,sessionId,maxWin,prizeWon,worth,menuItemsIds,menuItems,twisterPrizeWon,triggeringTransactionId,triggeringCause
+  START_TIME: '2022-01-06 00:00:00'
+  END_TIME: '2022-01-07 00:00:00'
+  FILED_THAT_RUN: id,userBonusId,userId,externalUserId,skinId,skin,skinGroup,skinOrigin,parentId,externalParentId,skinOriginId,skinGroupId,currency,internalAccount,statusId,status,bonusType,createdDate,expirationDate,expirationDays,bonusName,activeDays,amount,worth,amountLeft,points,promoCode,description,triggeringTransactionId,triggeringCause,freeSpinAmount,freeSpinsLeft,amountWon,prizeWon,maxWin,twisterPrizeWon,chipCountLeft,sessionId,menuItemsIds,menuItems
+  ES_ENV: stage
+  BANCH_VALUE: 30 MINUTES
 dle:
   IS_RUNNING: false
   index_config: indexes/playerinfoidx/config.yaml

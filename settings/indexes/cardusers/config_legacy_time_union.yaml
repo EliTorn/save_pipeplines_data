@@ -1,0 +1,15 @@
+parts:
+  - sql_file: parts/apple_pay/sql.sql
+    VALUE_COLM: parts/apple_pay/mapping.csv
+    TIME_DATE: ADU.CREATE_DATE
+  - sql_file: parts/regular/sql.sql
+    VALUE_COLM: parts/regular/mapping.csv
+    TIME_DATE: CCU.CREATIONDATE
+MODE: time_union
+ES_ENV: prod
+PK: id
+BANCH_VALUE: DAY
+INDEX_NAME: cardusers
+ES_TIME: creationDate
+ORCAL_TYPE: date
+ES_TYPE: DATE

@@ -1,0 +1,15 @@
+filed_orcal,filed_es,funciton_lambda
+id,id,
+DPAN_ID,cardId,convert_int_to_string
+CREATE_DATE,creationDate,convert_time_to_string
+DISPLAY_NAME,lastFourDigits,convert_last_four
+EXPIRATION_DATE,expiryDate,convert_yymmdd_to_iso
+,isWhitelisted,
+IN_BLACKLIST,isBlacklisted,convert_num_to_bool
+VERIFIED,isVerified,convert_num_to_bool
+NETWORK,companyName,
+TYPE,paymentMode,
+,bin,
+EXTERNALUSERIDS,externalUserIds,convert_str_to_list
+USERIDS,userIds,convert_str_to_list
+WALLET_TYPE,paymentSystem,convert_wallet_type_to_payment_system
